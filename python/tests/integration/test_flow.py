@@ -1,13 +1,13 @@
 """Integration tests — mock the Retrace API and test full SDK flow."""
 import json
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 import retrace
 import retrace.config as cfg
-from retrace.recorder import record, TraceRecorder
-from retrace.trace import Trace, Span, SpanType
+from retrace.recorder import record
 from retrace.transport import HTTPTransport
 
 
@@ -15,13 +15,14 @@ from retrace.transport import HTTPTransport
 def setup():
     cfg._config = None
     os.environ.pop("RETRACE_API_KEY", None)
-    retrace.configure(api_key="rt_live_integration_test", base_url="http://localhost:3001")
+    retrace.configure(api_key="rt_integration_test", base_url="http://localhost:3001")
     yield
     cfg._config = None
 
 
 def _make_http_transport(*args, **kwargs):
-    return HTTPTransport()
+    # Synchronous uploads: these tests assert on the request as soon as the run returns.
+    return HTTPTransport(background=False)
 
 
 class TestFullRecordingFlow:
@@ -104,7 +105,7 @@ class TestAPIContract:
 
         agent()
         assert mock_post.called
-        payload = mock_post.call_args[1]["json"]
+        payload = json.loads(mock_post.call_args[1]["data"])  # the body is encoded up front (default=str)
         assert "name" in payload or "id" in payload
 
     @patch("retrace.transport.requests.post")
@@ -118,7 +119,7 @@ class TestAPIContract:
 
         agent()
         headers = mock_post.call_args[1]["headers"]
-        assert headers.get("x-retrace-key") == "rt_live_integration_test"
+        assert headers.get("x-retrace-key") == "rt_integration_test"
 
     @patch("retrace.transport.requests.post")
     @patch("retrace.recorder.create_transport", side_effect=_make_http_transport)
@@ -137,7 +138,7 @@ class TestAPIContract:
 class TestDisabledSDK:
     def test_disabled_sdk_does_not_send(self):
         cfg._config = None
-        retrace.configure(api_key="rt_live_test", enabled=False)
+        retrace.configure(api_key="rt_test", enabled=False)
         # When disabled, record should still execute the function
         @record(name="disabled-test")
         def agent():

@@ -21,21 +21,6 @@ import { genId, nowIso, truncateJson } from "../utils.js";
 
 type Emit = (span: SpanData) => void;
 
-// Bounded dedup of emitted tool_result spans (keyed by provider tool-call id). Cleared when a
-// new trace installs its callback (see reset call in each interceptor) to bound memory.
-const emittedToolResultIds = new Set<string>();
-
-export function resetToolResultDedup(): void {
-  emittedToolResultIds.clear();
-}
-
-function markEmitted(id: string): boolean {
-  if (emittedToolResultIds.has(id)) return false;
-  if (emittedToolResultIds.size > 5000) emittedToolResultIds.clear();
-  emittedToolResultIds.add(id);
-  return true;
-}
-
 /** Parse a JSON-string arguments payload into structured JSON; leave non-strings as-is. */
 export function parseToolArgs(args: unknown): unknown {
   if (typeof args !== "string") return args;
@@ -133,7 +118,8 @@ export function emitOpenAIToolCalls(message: OAMessage | undefined, parentId: st
   }
 }
 
-/** Emit tool_result spans from OpenAI request messages (role:"tool"), deduped by tool_call_id. */
+/** Emit tool_result spans from OpenAI request messages (role:"tool"), tagged with their tool_call_id
+ *  (the recorder records each once per trace). */
 export function emitOpenAIToolResults(messages: OAMessage[] | undefined, emit: Emit): void {
   if (!Array.isArray(messages)) return;
   // Map tool_call_id -> tool name from any assistant tool_calls in the same message list.
@@ -145,7 +131,6 @@ export function emitOpenAIToolResults(messages: OAMessage[] | undefined, emit: E
   }
   for (const m of messages) {
     if (m?.role !== "tool" || !m.tool_call_id) continue;
-    if (!markEmitted(`oa:${m.tool_call_id}`)) continue;
     const content = m.content;
     const isError = typeof content === "string" && /error|exception|failed/i.test(content);
     emit(toolResultSpan(nameById.get(m.tool_call_id) || m.name || "tool_result", content, isError, m.tool_call_id));
@@ -172,7 +157,6 @@ export function emitAnthropicToolResults(messages: AnthropicMessage[] | undefine
     if (!Array.isArray(m?.content)) continue;
     for (const block of m.content as AnthropicBlock[]) {
       if (block?.type !== "tool_result" || !block.tool_use_id) continue;
-      if (!markEmitted(`anthropic:${block.tool_use_id}`)) continue;
       emit(toolResultSpan("tool_result", block.content, !!block.is_error, block.tool_use_id));
     }
   }
@@ -194,7 +178,7 @@ export function emitGeminiToolCalls(candidates: unknown, parentId: string, model
   }
 }
 
-/** Emit tool_result spans from Gemini request contents (functionResponse parts), deduped. */
+/** Emit tool_result spans from Gemini request contents (functionResponse parts). */
 export function emitGeminiToolResults(contents: unknown, emit: Emit): void {
   const list = Array.isArray(contents) ? contents : contents != null ? [contents] : [];
   for (const c of list as Array<{ parts?: GeminiPart[] }>) {
@@ -203,9 +187,38 @@ export function emitGeminiToolResults(contents: unknown, emit: Emit): void {
     for (const p of parts) {
       const fr = p.functionResponse;
       if (!fr) continue;
-      const key = `gemini:${fr.id || fr.name || JSON.stringify(fr.response).slice(0, 64)}`;
-      if (!markEmitted(key)) continue;
-      emit(toolResultSpan(fr.name || "tool_result", fr.response, false, fr.id || fr.name));
+      // The recorder records each tool result once per trace, keyed by this id.
+      const callId = fr.id || fr.name || `response:${JSON.stringify(fr.response).slice(0, 64)}`;
+      emit(toolResultSpan(fr.name || "tool_result", fr.response, false, callId));
     }
   }
 }
+
+function callText(name: unknown, args: unknown): string {
+  let rendered: string;
+  if (typeof args === "string") rendered = args;
+  else {
+    try { rendered = JSON.stringify(args ?? {}); } catch { rendered = String(args); }
+  }
+  return `${typeof name === "string" && name ? name : "tool"}(${rendered})`;
+}
+
+/** The assistant text of an OpenAI message, or a summary of the tools it called (a tool-calling turn
+ *  has no text, so its LLM span used to store an empty output). */
+export function openAIOutputText(message: OAMessage | undefined): string {
+  const text = message?.content;
+  if (typeof text === "string" && text) return text;
+  const calls = (message?.tool_calls ?? []) as Array<{ function?: { name?: string; arguments?: unknown } }>;
+  return calls.length ? `[tool calls] ${calls.map((c) => callText(c.function?.name, c.function?.arguments)).join("; ")}` : "";
+}
+
+/** All text blocks of an Anthropic response, or a summary of its tool_use blocks. */
+export function anthropicOutputText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  const blocks = content as Array<{ type?: string; text?: string; name?: string; input?: unknown }>;
+  const texts = blocks.filter((b) => b?.type === "text" && b.text).map((b) => b.text as string);
+  if (texts.length) return texts.join("\n");
+  const calls = blocks.filter((b) => b?.type === "tool_use").map((b) => callText(b.name, b.input));
+  return calls.length ? `[tool calls] ${calls.join("; ")}` : "";
+}
+

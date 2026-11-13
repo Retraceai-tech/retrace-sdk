@@ -5,6 +5,7 @@ import atexit
 import logging
 import os
 import sys
+from types import TracebackType
 from typing import Any, Optional
 
 from .config import configure, get_config, require_api_key
@@ -35,8 +36,8 @@ def init(
     name: str | None = None,
     api_key: str | None = None,
     auto_trace: bool = True,
-    metadata: dict | None = None,
-    **kwargs,
+    metadata: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> Optional[TraceRecorder]:
     """One-line zero-config init.
 
@@ -85,13 +86,15 @@ def init(
         # prior hook is always invoked, so a framework's excepthook keeps working.
         _prior_excepthook = sys.excepthook
 
-        def _retrace_excepthook(exc_type, exc, tb):
+        def _retrace_excepthook(
+            exc_type: type[BaseException], exc: BaseException, tb: TracebackType | None,
+        ) -> None:
             global _ambient
             rec = _ambient
             _ambient = None
             if rec is not None:
                 try:
-                    rec.end_trace(status=TraceStatus.FAILED, terminated_early=True)
+                    rec.end_trace(status=TraceStatus.FAILED, terminated_early=True, error=exc)
                 except Exception:  # never let our finalization mask the user's traceback
                     pass
             _prior_excepthook(exc_type, exc, tb)
@@ -101,8 +104,13 @@ def init(
 
 
 def get_active_recorder() -> Optional[TraceRecorder]:
-    """The ambient recorder started by :func:`init`, if any."""
-    return _ambient
+    """The recorder of the trace running in this context (``record()`` / ``@record``), else the
+    ambient recorder started by :func:`init`. Adapters (LangChain, CrewAI) record into it; they used
+    to see only the ambient trace, so tool spans from inside an ``@record`` function were lost (with
+    ``auto_trace=False``) or landed in the ambient trace instead of the run."""
+    from .interceptors._dispatch import current_recorder
+
+    return current_recorder() or _ambient
 
 
 def shutdown(output: Any = None, status: TraceStatus = TraceStatus.COMPLETED) -> None:

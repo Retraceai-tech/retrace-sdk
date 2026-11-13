@@ -11,13 +11,13 @@ beforeEach(() => {
 // ─── AUTH ───────────────────────────────────────────────────────────────────
 
 describe("Auth", () => {
-  it("accepts valid rt_live_ key", () => {
-    configure({ apiKey: "rt_live_abc123" });
-    expect(getConfig().apiKey).toBe("rt_live_abc123");
+  it("accepts valid rt_ key", () => {
+    configure({ apiKey: "rt_abc123" });
+    expect(getConfig().apiKey).toBe("rt_abc123");
   });
 
   it("throws on invalid key prefix", () => {
-    expect(() => configure({ apiKey: "sk-invalid" })).toThrow("rt_live_");
+    expect(() => configure({ apiKey: "sk-invalid" })).toThrow("rt_");
   });
 
   it("allows empty key at configure time", () => {
@@ -31,8 +31,8 @@ describe("Auth", () => {
   });
 
   it("requireApiKey returns key when set", () => {
-    configure({ apiKey: "rt_live_test" });
-    expect(requireApiKey()).toBe("rt_live_test");
+    configure({ apiKey: "rt_test" });
+    expect(requireApiKey()).toBe("rt_test");
   });
 
   it("recorder throws without API key", () => {
@@ -45,22 +45,22 @@ describe("Auth", () => {
 
 describe("Configuration", () => {
   it("derives wsUrl from baseUrl", () => {
-    configure({ apiKey: "rt_live_x", baseUrl: "https://api.example.com" });
+    configure({ apiKey: "rt_x", baseUrl: "https://api.example.com" });
     expect(getConfig().wsUrl).toBe("wss://api.example.com");
   });
 
   it("http baseUrl becomes ws", () => {
-    configure({ apiKey: "rt_live_x", baseUrl: "http://localhost:3001" });
+    configure({ apiKey: "rt_x", baseUrl: "http://localhost:3001" });
     expect(getConfig().wsUrl).toBe("ws://localhost:3001");
   });
 
   it("respects projectId", () => {
-    configure({ apiKey: "rt_live_x", projectId: "proj-123" });
+    configure({ apiKey: "rt_x", projectId: "proj-123" });
     expect(getConfig().projectId).toBe("proj-123");
   });
 
   it("respects enabled flag", () => {
-    configure({ apiKey: "rt_live_x", enabled: false });
+    configure({ apiKey: "rt_x", enabled: false });
     expect(getConfig().enabled).toBe(false);
   });
 });
@@ -69,16 +69,17 @@ describe("Configuration", () => {
 
 describe("Serialization", () => {
   it("recorder creates trace with correct name", () => {
-    configure({ apiKey: "rt_live_test" });
+    configure({ apiKey: "rt_test" });
     const rec = new TraceRecorder({ name: "my-trace" });
     rec.start();
     const data = rec.builder.toDict();
     expect(data.name).toBe("my-trace");
     expect(data.status).toBe(TraceStatus.RUNNING);
+    rec.end();
   });
 
   it("spans have correct types", () => {
-    configure({ apiKey: "rt_live_test" });
+    configure({ apiKey: "rt_test" });
     const rec = new TraceRecorder({ name: "span-test" });
     rec.start();
     const span = rec.startSpan("llm-call", SpanType.LLM_CALL, { messages: [] });
@@ -87,14 +88,16 @@ describe("Serialization", () => {
     const data = rec.builder.toDict();
     expect(data.spans!.length).toBe(1);
     expect(data.spans![0].output).toBe("response");
+    rec.end();
   });
 
   it("metadata is preserved", () => {
-    configure({ apiKey: "rt_live_test" });
+    configure({ apiKey: "rt_test" });
     const rec = new TraceRecorder({ name: "meta", metadata: { env: "test", version: 2 } });
     rec.start();
     const data = rec.builder.toDict();
     expect(data.metadata).toEqual({ env: "test", version: 2 });
+    rec.end();
   });
 });
 
@@ -118,15 +121,16 @@ describe("Invalid Inputs", () => {
 
 describe("Recorder Lifecycle", () => {
   it("start sets startedAt", () => {
-    configure({ apiKey: "rt_live_test" });
+    configure({ apiKey: "rt_test" });
     const rec = new TraceRecorder({ name: "lifecycle" });
     rec.start();
     const data = rec.builder.toDict();
     expect(data.started_at).toBeDefined();
+    rec.end();
   });
 
   it("end sets status to completed", () => {
-    configure({ apiKey: "rt_live_test" });
+    configure({ apiKey: "rt_test" });
     const rec = new TraceRecorder({ name: "lifecycle" });
     rec.start();
     rec.end("output");
@@ -136,7 +140,7 @@ describe("Recorder Lifecycle", () => {
   });
 
   it("error sets status to failed", () => {
-    configure({ apiKey: "rt_live_test" });
+    configure({ apiKey: "rt_test" });
     const rec = new TraceRecorder({ name: "lifecycle" });
     rec.start();
     rec.end(undefined, TraceStatus.FAILED);
@@ -145,7 +149,7 @@ describe("Recorder Lifecycle", () => {
   });
 
   it("multiple spans tracked", () => {
-    configure({ apiKey: "rt_live_test" });
+    configure({ apiKey: "rt_test" });
     const rec = new TraceRecorder({ name: "multi" });
     rec.start();
     const s1 = rec.startSpan("s1", SpanType.LLM_CALL);

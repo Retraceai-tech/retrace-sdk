@@ -1,23 +1,35 @@
 """Gemini interceptor for Retrace Python SDK."""
+import threading
 import time
 import uuid
+from typing import Any, AsyncGenerator, Callable, Generator, Optional
 
-from ._dispatch import capture_active_emit, register_open_span, unregister_open_span
 from ..pricing import UNKNOWN_MODEL_PRICING, cost_from_rate
+from ._dispatch import (
+    capture_active_emit,
+    is_retrace_wrapper,
+    mark_retrace_wrapper,
+    register_open_span,
+    unregister_open_span,
+)
+from ._messages import recorded_contents
 from .tool_spans import (
     emit_gemini_tool_calls,
     emit_gemini_tool_results,
     extract_sampling_params,
     extract_tool_schemas,
-    reset_tool_result_dedup,
 )
 
-_original_generate = None
-_original_async_generate = None
-_original_stream = None
-_original_async_stream = None
+_original_generate: Optional[Callable[..., Any]] = None
+_original_async_generate: Optional[Callable[..., Any]] = None
+_original_stream: Optional[Callable[..., Any]] = None
+_original_async_stream: Optional[Callable[..., Any]] = None
 _installed = False
-_on_span = None
+# Serializes install/uninstall. Concurrent first calls used to install twice: the second install
+# captured the first one's wrapper as the "original", so every call recursed into itself until
+# RecursionError (pass 8). The patch is applied once, under this lock, and a wrapper is never wrapped.
+_install_lock = threading.RLock()
+_on_span: Optional[Callable[[dict[str, Any]], Any]] = None
 
 PRICING = {
     # Gemini 3 series
@@ -41,9 +53,9 @@ def _calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return cost_from_rate(p, input_tokens, output_tokens)
 
 
-def _extract_output_text(result) -> str:
+def _extract_output_text(result: Any) -> str:
     """Safely extract text from a Gemini response, handling function-call-only responses."""
-    text = getattr(result, "text", None)
+    text: Optional[str] = getattr(result, "text", None)
     if text is not None:
         from ..config import get_config
         limit = get_config().max_payload_size
@@ -58,12 +70,16 @@ def _extract_output_text(result) -> str:
     return ""
 
 
-def install_gemini_interceptor(on_span=None):
+def install_gemini_interceptor(on_span: Optional[Callable[[dict[str, Any]], Any]] = None) -> None:
+    with _install_lock:
+        _install_gemini_interceptor_locked(on_span)
+
+
+def _install_gemini_interceptor_locked(on_span: Optional[Callable[[dict[str, Any]], Any]] = None) -> None:
     global _original_generate, _original_async_generate, _installed, _on_span
     if _installed:
         if on_span:
             _on_span = on_span
-        reset_tool_result_dedup()
         return
 
     try:
@@ -72,10 +88,12 @@ def install_gemini_interceptor(on_span=None):
         return
 
     _on_span = on_span
-    reset_tool_result_dedup()
+    if is_retrace_wrapper(genai.models.Models.generate_content):
+        _installed = True
+        return
     _original_generate = genai.models.Models.generate_content
 
-    def patched_generate(self, *args, **kwargs):
+    def patched_generate(self: Any, *args: Any, **kwargs: Any) -> Any:
         from retrace.replay import consume_cassette_entry, is_replaying
 
         model = kwargs.get("model", args[0] if args else "unknown")
@@ -111,8 +129,10 @@ def install_gemini_interceptor(on_span=None):
 
             if is_stream and hasattr(result, "__iter__") and not isinstance(result, (str, bytes)):
                 # Wrap streaming response to capture after all chunks consumed
-                def _stream_wrapper(stream, span_id, model, contents, start):
-                    chunks = []
+                def _stream_wrapper(
+                    stream: Any, span_id: str, model: Any, contents: Any, start: float,
+                ) -> Generator[Any, None, None]:
+                    chunks: list[Any] = []
                     for chunk in stream:
                         chunks.append(chunk)
                         yield chunk
@@ -125,7 +145,7 @@ def install_gemini_interceptor(on_span=None):
                             "span_type": "llm_call",
                             "name": "retrace.ai.generate",
                             "model": model,
-                            "input": str(contents)[:2000] if contents else None,
+                            "input": recorded_contents(contents),
                             "output": full_text[:2000],
                             "duration_ms": duration_ms,
                         })
@@ -141,7 +161,7 @@ def install_gemini_interceptor(on_span=None):
                     "span_type": "llm_call",
                     "name": "retrace.ai.generate",
                     "model": model,
-                    "input": str(contents)[:2000] if contents else None,
+                    "input": recorded_contents(contents),
                     "output": _extract_output_text(result),
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -164,13 +184,14 @@ def install_gemini_interceptor(on_span=None):
                     "span_type": "llm_call",
                     "name": "retrace.ai.generate",
                     "model": model,
-                    "input": str(contents)[:2000] if contents else None,
+                    "input": recorded_contents(contents),
                     "duration_ms": duration_ms,
                     "error": str(e),
                 })
             raise
 
-    genai.models.Models.generate_content = patched_generate
+    mark_retrace_wrapper(patched_generate)
+    setattr(genai.models.Models, "generate_content", patched_generate)
 
     # Streaming via the real API: generate_content_stream (NOT generate_content+stream flag). Two-phase
     # streaming-A (model (b)): open the span at invocation (registered with the active recorder in the
@@ -183,12 +204,15 @@ def install_gemini_interceptor(on_span=None):
         _original_stream = genai.models.Models.generate_content_stream
 
     if _original_stream is not None:
-        def patched_generate_content_stream(self, *args, **kwargs):
+        def patched_generate_content_stream(self: Any, *args: Any, **kwargs: Any) -> Any:
             from retrace.replay import consume_cassette_entry, is_replaying
             model = kwargs.get("model", args[0] if args else "unknown")
             contents = kwargs.get("contents", args[1] if len(args) > 1 else None)
             _cfg = kwargs.get("config") or (args[2] if len(args) > 2 else None)
-            _cfg_tools = (_cfg.get("tools") if isinstance(_cfg, dict) else getattr(_cfg, "tools", None)) if _cfg is not None else None
+            _cfg_tools = (
+                (_cfg.get("tools") if isinstance(_cfg, dict) else getattr(_cfg, "tools", None))
+                if _cfg is not None else None
+            )
             tool_schemas = extract_tool_schemas("gemini", _cfg_tools)
             sampling = extract_sampling_params("gemini", {"config": _cfg})
             span_id = str(uuid.uuid4())
@@ -197,16 +221,21 @@ def install_gemini_interceptor(on_span=None):
             if is_replaying():
                 entry = consume_cassette_entry("gemini.generate_content", "llm_call")
                 if entry:
-                    def _mock():
+                    def _mock() -> Generator[Any, None, None]:
                         from unittest.mock import MagicMock
-                        m = MagicMock(); m.text = entry.get("output_raw") or entry.get("output", ""); yield m
+                        m = MagicMock()
+                        m.text = entry.get("output_raw") or entry.get("output", "")
+                        yield m
                     return _mock()
 
             raw = _original_stream(self, *args, **kwargs)
             bound_emit = capture_active_emit() or _on_span
-            st = {"chunks": [], "in_tok": 0, "out_tok": 0, "saw_fn": False, "last_candidates": None, "err": None, "emitted": False}
+            st: dict[str, Any] = {
+                "chunks": [], "in_tok": 0, "out_tok": 0, "saw_fn": False,
+                "last_candidates": None, "err": None, "emitted": False,
+            }
 
-            def finalize(reason):
+            def finalize(reason: str) -> None:
                 if st["emitted"]:
                     return
                 st["emitted"] = True
@@ -219,14 +248,14 @@ def install_gemini_interceptor(on_span=None):
                     if calls:
                         text = f"[function_call: {', '.join(calls)}]"
                 if bound_emit:
-                    md = {"streaming": True, "capture_complete": complete}
+                    md: dict[str, Any] = {"streaming": True, "capture_complete": complete}
                     if tool_schemas:
                         md["tool_schemas"] = tool_schemas
                     if sampling:
                         md["sampling"] = sampling
                     bound_emit({
                         "id": span_id, "span_type": "llm_call", "name": "retrace.ai.generate", "model": model,
-                        "input": str(contents)[:2000] if contents else None, "output": text[:2000],
+                        "input": recorded_contents(contents), "output": text[:2000],
                         "input_tokens": st["in_tok"], "output_tokens": st["out_tok"],
                         "cost": _calc_cost(model, st["in_tok"], st["out_tok"]),
                         "duration_ms": int((time.time() - start) * 1000),
@@ -238,7 +267,7 @@ def install_gemini_interceptor(on_span=None):
 
             register_open_span(span_id, finalize)
 
-            def wrapped():
+            def wrapped() -> Generator[Any, None, None]:
                 try:
                     for chunk in raw:
                         t = getattr(chunk, "text", None)
@@ -267,7 +296,7 @@ def install_gemini_interceptor(on_span=None):
                     finalize("partial")
             return wrapped()
 
-        genai.models.Models.generate_content_stream = patched_generate_content_stream
+        setattr(genai.models.Models, "generate_content_stream", patched_generate_content_stream)
 
     # Async client instrumentation (client.aio.models / AsyncModels).
     try:
@@ -275,7 +304,7 @@ def install_gemini_interceptor(on_span=None):
             _original_async_generate = genai.models.AsyncModels.generate_content
 
         if _original_async_generate is not None:
-            async def patched_async_generate(self, *args, **kwargs):
+            async def patched_async_generate(self: Any, *args: Any, **kwargs: Any) -> Any:
                 from retrace.replay import consume_cassette_entry, is_replaying
 
                 model = kwargs.get("model", args[0] if args else "unknown")
@@ -311,7 +340,7 @@ def install_gemini_interceptor(on_span=None):
                             "span_type": "llm_call",
                             "name": "retrace.ai.generate",
                             "model": model,
-                            "input": str(contents)[:2000] if contents else None,
+                            "input": recorded_contents(contents),
                             "output": _extract_output_text(result),
                             "input_tokens": input_tokens,
                             "output_tokens": output_tokens,
@@ -333,29 +362,37 @@ def install_gemini_interceptor(on_span=None):
                             "span_type": "llm_call",
                             "name": "retrace.ai.generate",
                             "model": model,
-                            "input": str(contents)[:2000] if contents else None,
+                            "input": recorded_contents(contents),
                             "duration_ms": duration_ms,
                             "error": str(e),
                         })
                     raise
 
-            genai.models.AsyncModels.generate_content = patched_async_generate
+            setattr(genai.models.AsyncModels, "generate_content", patched_async_generate)
 
         # Async streaming: AsyncModels.generate_content_stream (class method → retroactive, F-T2).
         # finalize() is fully SYNCHRONOUS (no await / no loop scheduling) so the sync atexit/SIGTERM
         # backstop can finalize an async-origin open span even after the event loop is torn down.
         global _original_async_stream
-        if _original_async_stream is None and hasattr(genai.models, "AsyncModels") and hasattr(genai.models.AsyncModels, "generate_content_stream"):
+        if (
+            _original_async_stream is None
+            and hasattr(genai.models, "AsyncModels")
+            and hasattr(genai.models.AsyncModels, "generate_content_stream")
+        ):
             _original_async_stream = genai.models.AsyncModels.generate_content_stream
 
         if _original_async_stream is not None:
-            async def patched_async_stream(self, *args, **kwargs):
+            async def patched_async_stream(self: Any, *args: Any, **kwargs: Any) -> Any:
                 import inspect as _inspect
+
                 from retrace.replay import consume_cassette_entry, is_replaying
                 model = kwargs.get("model", args[0] if args else "unknown")
                 contents = kwargs.get("contents", args[1] if len(args) > 1 else None)
                 _cfg = kwargs.get("config") or (args[2] if len(args) > 2 else None)
-                _cfg_tools = (_cfg.get("tools") if isinstance(_cfg, dict) else getattr(_cfg, "tools", None)) if _cfg is not None else None
+                _cfg_tools = (
+                    (_cfg.get("tools") if isinstance(_cfg, dict) else getattr(_cfg, "tools", None))
+                    if _cfg is not None else None
+                )
                 tool_schemas = extract_tool_schemas("gemini", _cfg_tools)
                 sampling = extract_sampling_params("gemini", {"config": _cfg})
                 span_id = str(uuid.uuid4())
@@ -364,9 +401,11 @@ def install_gemini_interceptor(on_span=None):
                 if is_replaying():
                     entry = consume_cassette_entry("gemini.generate_content", "llm_call")
                     if entry:
-                        async def _amock():
+                        async def _amock() -> AsyncGenerator[Any, None]:
                             from unittest.mock import MagicMock
-                            m = MagicMock(); m.text = entry.get("output_raw") or entry.get("output", ""); yield m
+                            m = MagicMock()
+                            m.text = entry.get("output_raw") or entry.get("output", "")
+                            yield m
                         return _amock()
 
                 raw = _original_async_stream(self, *args, **kwargs)
@@ -374,9 +413,12 @@ def install_gemini_interceptor(on_span=None):
                     raw = await raw  # some SDK builds return a coroutine resolving to the async iterator
 
                 bound_emit = capture_active_emit() or _on_span
-                st = {"chunks": [], "in_tok": 0, "out_tok": 0, "saw_fn": False, "last_candidates": None, "err": None, "emitted": False}
+                st: dict[str, Any] = {
+                    "chunks": [], "in_tok": 0, "out_tok": 0, "saw_fn": False,
+                    "last_candidates": None, "err": None, "emitted": False,
+                }
 
-                def finalize(reason):  # SYNCHRONOUS — safe to call from the sync backstop with no loop
+                def finalize(reason: str) -> None:  # SYNCHRONOUS — safe to call from the sync backstop with no loop
                     if st["emitted"]:
                         return
                     st["emitted"] = True
@@ -389,14 +431,14 @@ def install_gemini_interceptor(on_span=None):
                         if calls:
                             text = f"[function_call: {', '.join(calls)}]"
                     if bound_emit:
-                        md = {"streaming": True, "capture_complete": complete}
+                        md: dict[str, Any] = {"streaming": True, "capture_complete": complete}
                         if tool_schemas:
                             md["tool_schemas"] = tool_schemas
                         if sampling:
                             md["sampling"] = sampling
                         bound_emit({
                             "id": span_id, "span_type": "llm_call", "name": "retrace.ai.generate", "model": model,
-                            "input": str(contents)[:2000] if contents else None, "output": text[:2000],
+                            "input": recorded_contents(contents), "output": text[:2000],
                             "input_tokens": st["in_tok"], "output_tokens": st["out_tok"],
                             "cost": _calc_cost(model, st["in_tok"], st["out_tok"]),
                             "duration_ms": int((time.time() - start) * 1000),
@@ -408,7 +450,7 @@ def install_gemini_interceptor(on_span=None):
 
                 register_open_span(span_id, finalize)
 
-                async def wrapped():
+                async def wrapped() -> AsyncGenerator[Any, None]:
                     try:
                         async for chunk in raw:
                             t = getattr(chunk, "text", None)
@@ -442,26 +484,35 @@ def install_gemini_interceptor(on_span=None):
                         finalize("partial")
                 return wrapped()
 
-            genai.models.AsyncModels.generate_content_stream = patched_async_stream
+            setattr(genai.models.AsyncModels, "generate_content_stream", patched_async_stream)
     except (ImportError, AttributeError):
         pass
 
     _installed = True
 
 
-def uninstall_gemini_interceptor():
+def uninstall_gemini_interceptor() -> None:
+    with _install_lock:
+        _uninstall_gemini_interceptor_locked()
+
+
+def _uninstall_gemini_interceptor_locked() -> None:
     global _installed, _on_span, _original_generate
     if not _installed or not _original_generate:
         return
     try:
         from google import genai
-        genai.models.Models.generate_content = _original_generate
+        setattr(genai.models.Models, "generate_content", _original_generate)
         if _original_stream is not None and hasattr(genai.models.Models, "generate_content_stream"):
-            genai.models.Models.generate_content_stream = _original_stream
+            setattr(genai.models.Models, "generate_content_stream", _original_stream)
         if _original_async_generate is not None and hasattr(genai.models, "AsyncModels"):
-            genai.models.AsyncModels.generate_content = _original_async_generate
-        if _original_async_stream is not None and hasattr(genai.models, "AsyncModels") and hasattr(genai.models.AsyncModels, "generate_content_stream"):
-            genai.models.AsyncModels.generate_content_stream = _original_async_stream
+            setattr(genai.models.AsyncModels, "generate_content", _original_async_generate)
+        if (
+            _original_async_stream is not None
+            and hasattr(genai.models, "AsyncModels")
+            and hasattr(genai.models.AsyncModels, "generate_content_stream")
+        ):
+            setattr(genai.models.AsyncModels, "generate_content_stream", _original_async_stream)
     except ImportError:
         pass
     _installed = False

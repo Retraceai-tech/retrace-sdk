@@ -1,7 +1,8 @@
 """Comprehensive test suite for retrace Python SDK."""
 import json
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 import retrace.config as cfg
@@ -21,18 +22,18 @@ def reset_config():
 class TestConfig:
     def test_defaults(self):
         c = cfg.get_config()
-        assert c.base_url == "https://api-retrace.yashbogam.me"
-        assert c.ws_url == "wss://api-retrace.yashbogam.me"
+        assert c.base_url == "https://api.retraceai.tech"
+        assert c.ws_url == "wss://api.retraceai.tech"
         assert c.enabled is True
         assert c.api_key == ""
         assert c.project_id is None
 
     def test_env_vars(self):
-        os.environ["RETRACE_API_KEY"] = "rt_live_env"
+        os.environ["RETRACE_API_KEY"] = "rt_env"
         os.environ["RETRACE_BASE_URL"] = "https://api.example.com"
         os.environ["RETRACE_PROJECT_ID"] = "proj-123"
         c = cfg.get_config()
-        assert c.api_key == "rt_live_env"
+        assert c.api_key == "rt_env"
         assert c.base_url == "https://api.example.com"
         assert c.ws_url == "wss://api.example.com"
         assert c.project_id == "proj-123"
@@ -44,9 +45,9 @@ class TestConfig:
             assert cfg.get_config().enabled is False
 
     def test_configure_override(self):
-        cfg.configure(api_key="rt_live_x", base_url="https://c.io")
+        cfg.configure(api_key="rt_x", base_url="https://c.io")
         c = cfg.get_config()
-        assert c.api_key == "rt_live_x"
+        assert c.api_key == "rt_x"
         assert c.ws_url == "wss://c.io"
 
     def test_configure_updates_ws_url(self):
@@ -79,7 +80,7 @@ class TestTraceModel:
         assert "cost" not in d
 
     def test_trace_serialization(self):
-        from retrace import Trace, Span, SpanType
+        from retrace import Span, SpanType, Trace
         t = Trace(name="t", input="hi")
         t.spans.append(Span(name="s", span_type=SpanType.LLM_CALL))
         d = t.to_dict()
@@ -113,8 +114,9 @@ class TestTraceModel:
 class TestRecorder:
     @patch("retrace.recorder.create_transport")
     def test_decorator(self, mt):
-        m = MagicMock(); mt.return_value = m
-        cfg.configure(api_key="rt_live_t", base_url="http://x:1", enabled=True)
+        m = MagicMock()
+        mt.return_value = m
+        cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1", enabled=True)
         from retrace import record
 
         @record(name="agent")
@@ -127,8 +129,9 @@ class TestRecorder:
 
     @patch("retrace.recorder.create_transport")
     def test_decorator_no_parens(self, mt):
-        m = MagicMock(); mt.return_value = m
-        cfg.configure(api_key="rt_live_t", base_url="http://x:1", enabled=True)
+        m = MagicMock()
+        mt.return_value = m
+        cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1", enabled=True)
         from retrace import record
 
         @record
@@ -138,8 +141,9 @@ class TestRecorder:
 
     @patch("retrace.recorder.create_transport")
     def test_context_manager(self, mt):
-        m = MagicMock(); mt.return_value = m
-        cfg.configure(api_key="rt_live_t", base_url="http://x:1", enabled=True)
+        m = MagicMock()
+        mt.return_value = m
+        cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1", enabled=True)
         from retrace import record
 
         with record(name="ctx", input="in") as t:
@@ -150,8 +154,9 @@ class TestRecorder:
 
     @patch("retrace.recorder.create_transport")
     def test_exception_marks_failed(self, mt):
-        m = MagicMock(); mt.return_value = m
-        cfg.configure(api_key="rt_live_t", base_url="http://x:1", enabled=True)
+        m = MagicMock()
+        mt.return_value = m
+        cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1", enabled=True)
         from retrace import record
 
         @record(name="bad")
@@ -165,9 +170,10 @@ class TestRecorder:
 
     @patch("retrace.recorder.create_transport")
     def test_network_failure_doesnt_crash(self, mt):
-        m = MagicMock(); m.send.side_effect = ConnectionError("down")
+        m = MagicMock()
+        m.send.side_effect = ConnectionError("down")
         mt.return_value = m
-        cfg.configure(api_key="rt_live_t", base_url="http://x:1", enabled=True)
+        cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1", enabled=True)
         from retrace import record
 
         @record(name="net")
@@ -176,7 +182,7 @@ class TestRecorder:
         assert f() == "ok"
 
     def test_disabled_is_noop(self):
-        cfg.configure(api_key="rt_live_t", enabled=False)
+        cfg.configure(api_key="rt_t", enabled=False)
         from retrace import record
 
         @record(name="off")
@@ -186,9 +192,10 @@ class TestRecorder:
 
     @patch("retrace.recorder.create_transport")
     def test_span_tracking(self, mt):
-        m = MagicMock(); mt.return_value = m
-        cfg.configure(api_key="rt_live_t", base_url="http://x:1", enabled=True)
-        from retrace import TraceRecorder, SpanType
+        m = MagicMock()
+        mt.return_value = m
+        cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1", enabled=True)
+        from retrace import SpanType, TraceRecorder
 
         rec = TraceRecorder(name="test")
         rec.start_trace()
@@ -203,7 +210,7 @@ class TestRecorder:
 class TestTransport:
     def test_http_accumulate_and_flush(self):
         from retrace.transport import HTTPTransport
-        cfg.configure(api_key="rt_live_t", base_url="http://x:1")
+        cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1")
 
         with patch("retrace.transport.requests.post", return_value=MagicMock(status_code=200)) as mp:
             http = HTTPTransport()
@@ -214,15 +221,16 @@ class TestTransport:
                                         "name": "s", "started_at": "2026-01-01T00:00:00Z"})
             http.send("span_ended", {"id": "s1", "ended_at": "2026-01-01T00:00:01Z", "output": "hi"})
             http.send("trace_ended", {"id": "abc", "ended_at": "2026-01-01T00:00:02Z", "status": "completed"})
+            http.flush()  # uploads run on the background uploader; flush waits for them
             assert mp.called
-            body = mp.call_args[1]["json"]
+            body = json.loads(mp.call_args[1]["data"])  # encoded up front (default=str)
             assert body["id"] == "abc"
             assert len(body["spans"]) == 1
             assert body["spans"][0]["output"] == "hi"
 
     def test_http_flush_on_close(self):
         from retrace.transport import HTTPTransport
-        cfg.configure(api_key="rt_live_t", base_url="http://x:1")
+        cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1")
 
         with patch("retrace.transport.requests.post", return_value=MagicMock(status_code=200)) as mp:
             http = HTTPTransport()
@@ -232,7 +240,7 @@ class TestTransport:
             assert mp.called
 
     def test_create_transport_http(self):
-        from retrace.transport import create_transport, HTTPTransport
+        from retrace.transport import HTTPTransport, create_transport
         assert isinstance(create_transport("http"), HTTPTransport)
 
     def test_create_transport_ws_type(self):
@@ -244,7 +252,7 @@ class TestTransport:
 
 class TestReadmeExamples:
     def test_python_readme(self):
-        cfg.configure(api_key="rt_live_t", enabled=False)
+        cfg.configure(api_key="rt_t", enabled=False)
         import retrace
 
         @retrace.record(name="my-agent")

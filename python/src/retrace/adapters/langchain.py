@@ -24,18 +24,22 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from ..init import get_active_recorder
+from ..recorder import TraceRecorder
 from ..trace import SpanType
 
 logger = logging.getLogger("retrace")
 
 try:  # langchain-core is an OPTIONAL peer dependency
-    from langchain_core.callbacks import BaseCallbackHandler as _Base  # type: ignore
+    from langchain_core.callbacks import BaseCallbackHandler as _LangChainBase
+
+    # Any: the base class is langchain-core's when installed, else `object`.
+    _Base: Any = _LangChainBase
     _HAS_LANGCHAIN = True
 except Exception:  # pragma: no cover - exercised only without langchain installed
-    _Base = object  # type: ignore
+    _Base = object
     _HAS_LANGCHAIN = False
 
 
@@ -59,11 +63,13 @@ class RetraceCallbackHandler(_Base):  # type: ignore[misc]
         self._recorder = recorder
         self._open: dict[str, str] = {}  # run_id -> span_id
 
-    def _rec(self):
+    def _rec(self) -> Optional[TraceRecorder]:
         return self._recorder or get_active_recorder()
 
     # ── Tools ────────────────────────────────────────────────────────────────
-    def on_tool_start(self, serialized: dict | None, input_str: str, *, run_id: Any = None, **kwargs: Any) -> None:
+    def on_tool_start(
+        self, serialized: dict[str, Any] | None, input_str: str, *, run_id: Any = None, **kwargs: Any,
+    ) -> None:
         rec = self._rec()
         if not rec:
             return
@@ -92,7 +98,9 @@ class RetraceCallbackHandler(_Base):  # type: ignore[misc]
             rec.end_span(sid, error=str(error))
 
     # ── Retriever ────────────────────────────────────────────────────────────
-    def on_retriever_start(self, serialized: dict | None, query: str, *, run_id: Any = None, **kwargs: Any) -> None:
+    def on_retriever_start(
+        self, serialized: dict[str, Any] | None, query: str, *, run_id: Any = None, **kwargs: Any,
+    ) -> None:
         rec = self._rec()
         if not rec:
             return
@@ -110,7 +118,9 @@ class RetraceCallbackHandler(_Base):  # type: ignore[misc]
             rec.end_span(sid, output=_truncate({"count": len(docs), "documents": docs}))
 
     # ── Chains / agents ──────────────────────────────────────────────────────
-    def on_chain_start(self, serialized: dict | None, inputs: Any, *, run_id: Any = None, **kwargs: Any) -> None:
+    def on_chain_start(
+        self, serialized: dict[str, Any] | None, inputs: Any, *, run_id: Any = None, **kwargs: Any,
+    ) -> None:
         rec = self._rec()
         if not rec:
             return

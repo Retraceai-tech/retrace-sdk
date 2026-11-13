@@ -6,7 +6,7 @@ import type { SpanData } from "./trace.js";
 
 beforeAll(() => {
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, text: async () => "" })));
-  configure({ apiKey: "rt_live_testkey", transport: "http", baseUrl: "http://127.0.0.1:0" });
+  configure({ apiKey: "rt_testkey", transport: "http", baseUrl: "http://127.0.0.1:0" });
 });
 
 function mkSpan(n: number): SpanData {

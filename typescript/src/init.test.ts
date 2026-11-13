@@ -19,12 +19,12 @@ describe("init (zero-config)", () => {
   });
 
   it("returns null when disabled", () => {
-    configure({ apiKey: "rt_live_test", enabled: false });
+    configure({ apiKey: "rt_test", enabled: false });
     expect(init()).toBeNull();
   });
 
   it("auto-starts an ambient trace and shuts down idempotently", () => {
-    configure({ apiKey: "rt_live_test", enabled: true });
+    configure({ apiKey: "rt_test", enabled: true });
     const rec = init({ name: "unit-agent" });
     expect(rec).not.toBeNull();
     expect(getActiveRecorder()).toBe(rec);
@@ -35,7 +35,7 @@ describe("init (zero-config)", () => {
   });
 
   it("is a singleton — repeated init returns the same recorder", () => {
-    configure({ apiKey: "rt_live_test", enabled: true });
+    configure({ apiKey: "rt_test", enabled: true });
     const a = init({ name: "x" });
     const b = init({ name: "y" });
     expect(a).toBe(b);

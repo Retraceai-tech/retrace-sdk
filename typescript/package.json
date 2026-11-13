@@ -1,6 +1,6 @@
 {
   "name": "retrace-sdk",
-  "version": "0.16.0",
+  "version": "0.16.25",
   "description": "The execution replay engine for AI agents. Record, replay, fork, and share agent executions.",
   "type": "module",
   "main": "dist/index.js",
@@ -8,27 +8,44 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./adapters/langchain": {
       "types": "./dist/adapters/langchain.d.ts",
-      "import": "./dist/adapters/langchain.js"
+      "import": "./dist/adapters/langchain.js",
+      "default": "./dist/adapters/langchain.js"
     },
     "./adapters/vercel-ai": {
       "types": "./dist/adapters/vercel-ai.d.ts",
-      "import": "./dist/adapters/vercel-ai.js"
+      "import": "./dist/adapters/vercel-ai.js",
+      "default": "./dist/adapters/vercel-ai.js"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "license": "MIT",
   "author": "Yash Bogam",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yash1511-bogam/retrace-sdk",
+    "url": "git+https://github.com/Retraceai-tech/retrace-sdk.git",
     "directory": "packages/sdk-typescript"
   },
-  "homepage": "https://retrace.yashbogam.me/docs/sdk-typescript",
-  "keywords": ["ai", "agent", "tracing", "observability", "replay", "llm", "openai", "anthropic", "gemini"],
+  "homepage": "https://retraceai.tech/docs/sdk-typescript",
+  "keywords": [
+    "ai",
+    "agent",
+    "tracing",
+    "observability",
+    "replay",
+    "llm",
+    "openai",
+    "anthropic",
+    "gemini"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -39,14 +56,14 @@
     "test": "vitest run",
     "prepublishOnly": "npm run build"
   },
-  "dependencies": {
-    "ws": "^8.20.1"
+  "optionalDependencies": {
+    "ws": "^8.22.2"
   },
   "peerDependencies": {
-    "@google/genai": ">=1.52.0",
-    "openai": ">=4.0.0",
     "@anthropic-ai/sdk": ">=0.30.0",
-    "@langchain/core": ">=0.3.0"
+    "@google/genai": ">=1.52.0",
+    "@langchain/core": ">=0.3.0",
+    "openai": ">=4.0.0"
   },
   "peerDependenciesMeta": {
     "@google/genai": {
@@ -63,11 +80,11 @@
     }
   },
   "devDependencies": {
-    "@google/genai": "^1.52.0",
-    "@types/node": "22.15.3",
-    "@types/ws": "8.18.1",
-    "typescript": "6.0.3",
-    "openai": "^4.90.0",
-    "@anthropic-ai/sdk": "^0.95.0"
+    "@anthropic-ai/sdk": "^1.8.0",
+    "@google/genai": "^3.2.0",
+    "@types/node": "26.6.6",
+    "@types/ws": "8.18.2",
+    "openai": "^7.55.0",
+    "typescript": "6.0.3"
   }
 }

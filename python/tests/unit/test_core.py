@@ -1,17 +1,14 @@
 """Unit tests for retrace Python SDK — auth, retries, timeouts, errors, serialization."""
-import json
 import os
-import time
-import threading
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import MagicMock, patch
+
 import pytest
 
-import retrace
 import retrace.config as cfg
 from retrace.config import configure, get_config, require_api_key
 from retrace.recorder import TraceRecorder, record
-from retrace.trace import Trace, Span, SpanType, TraceStatus
-from retrace.transport import HTTPTransport, WSTransport
+from retrace.trace import Span, SpanType, Trace, TraceStatus
+from retrace.transport import HTTPTransport
 
 
 @pytest.fixture(autouse=True)
@@ -29,11 +26,11 @@ def reset_state():
 
 class TestAuth:
     def test_valid_api_key(self):
-        c = configure(api_key="rt_live_abc123")
-        assert c.api_key == "rt_live_abc123"
+        c = configure(api_key="rt_abc123")
+        assert c.api_key == "rt_abc123"
 
     def test_invalid_prefix_raises(self):
-        with pytest.raises(ValueError, match="rt_live_"):
+        with pytest.raises(ValueError, match="rt_"):
             configure(api_key="sk-invalid-key")
 
     def test_empty_key_allowed_at_configure(self):
@@ -46,13 +43,13 @@ class TestAuth:
             require_api_key()
 
     def test_require_api_key_returns_key(self):
-        configure(api_key="rt_live_test123")
-        assert require_api_key() == "rt_live_test123"
+        configure(api_key="rt_test123")
+        assert require_api_key() == "rt_test123"
 
     def test_env_var_api_key(self):
-        os.environ["RETRACE_API_KEY"] = "rt_live_from_env"
+        os.environ["RETRACE_API_KEY"] = "rt_from_env"
         c = get_config()
-        assert c.api_key == "rt_live_from_env"
+        assert c.api_key == "rt_from_env"
 
     def test_recorder_requires_key(self):
         configure(api_key="")
@@ -65,10 +62,10 @@ class TestAuth:
 class TestConfiguration:
     def test_base_url_default(self):
         c = get_config()
-        assert c.base_url == "https://api-retrace.yashbogam.me"
+        assert c.base_url == "https://api.retraceai.tech"
 
     def test_ws_url_derived(self):
-        configure(api_key="rt_live_x", base_url="https://api.example.com")
+        configure(api_key="rt_x", base_url="https://api.example.com")
         c = get_config()
         assert c.ws_url == "wss://api.example.com"
 
@@ -78,7 +75,7 @@ class TestConfiguration:
         assert c.enabled is False
 
     def test_project_id(self):
-        configure(api_key="rt_live_x", project_id="proj-123")
+        configure(api_key="rt_x", project_id="proj-123")
         assert get_config().project_id == "proj-123"
 
 
@@ -125,7 +122,7 @@ class TestSerialization:
 
 class TestInvalidInputs:
     def test_record_with_no_name_uses_function_name(self):
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         with patch("retrace.recorder.create_transport") as mock_t:
             mock_t.return_value = MagicMock()
 
@@ -153,28 +150,31 @@ class TestNetworkFailures:
     @patch("retrace.transport.requests.post")
     def test_http_transport_handles_connection_error(self, mock_post):
         mock_post.side_effect = ConnectionError("Connection refused")
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         transport = HTTPTransport()
         transport.send("trace_started", {"id": "t1", "name": "fail"})
         transport.send("trace_ended", {"status": "completed"})
+        transport.flush()
         # flush should not raise
 
     @patch("retrace.transport.requests.post")
     def test_http_transport_handles_timeout(self, mock_post):
         import requests as req
         mock_post.side_effect = req.Timeout("Timed out")
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         transport = HTTPTransport()
         transport.send("trace_started", {"id": "t1", "name": "timeout"})
         transport.send("trace_ended", {"status": "completed"})
+        transport.flush()
 
     @patch("retrace.transport.requests.post")
     def test_http_transport_handles_500(self, mock_post):
         mock_post.return_value = MagicMock(status_code=500, text="Internal Server Error")
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         transport = HTTPTransport()
         transport.send("trace_started", {"id": "t1", "name": "server-error"})
         transport.send("trace_ended", {"status": "completed"})
+        transport.flush()
 
 
 # ─── RATE LIMITS ───────────────────────────────────────────────────────────
@@ -183,27 +183,29 @@ class TestRateLimits:
     @patch("retrace.transport.requests.post")
     def test_http_transport_handles_429(self, mock_post):
         mock_post.return_value = MagicMock(status_code=429, text="Rate limited")
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         transport = HTTPTransport()
         transport.send("trace_started", {"id": "t1", "name": "rate-limited"})
         transport.send("trace_ended", {"status": "completed"})
+        transport.flush()
 
     @patch("retrace.transport.requests.post")
     def test_http_sends_auth_header(self, mock_post):
         mock_post.return_value = MagicMock(status_code=200)
-        configure(api_key="rt_live_mykey123")
+        configure(api_key="rt_mykey123")
         transport = HTTPTransport()
         transport.send("trace_started", {"id": "t1", "name": "auth-check"})
-        transport.send("trace_ended", {"status": "completed"})
+        transport.send("trace_ended", {"id": "t1", "status": "completed"})
+        transport.flush()
         headers = mock_post.call_args[1]["headers"]
-        assert headers["x-retrace-key"] == "rt_live_mykey123"
+        assert headers["x-retrace-key"] == "rt_mykey123"
 
 
 # ─── RECORDER ──────────────────────────────────────────────────────────────
 
 class TestRecorder:
     def test_decorator_captures_return_value(self):
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         with patch("retrace.recorder.create_transport") as mock_t:
             mock_transport = MagicMock()
             mock_t.return_value = mock_transport
@@ -216,7 +218,7 @@ class TestRecorder:
             assert result == 5
 
     def test_decorator_captures_exception(self):
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         with patch("retrace.recorder.create_transport") as mock_t:
             mock_t.return_value = MagicMock()
 
@@ -228,14 +230,14 @@ class TestRecorder:
                 fail()
 
     def test_resumable_flag(self):
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         with patch("retrace.recorder.create_transport") as mock_t:
             mock_t.return_value = MagicMock()
             rec = TraceRecorder(name="resumable-test", resumable=True)
             assert rec._trace.metadata.get("_resumable") is True
 
     def test_non_resumable_default(self):
-        configure(api_key="rt_live_test")
+        configure(api_key="rt_test")
         with patch("retrace.recorder.create_transport") as mock_t:
             mock_t.return_value = MagicMock()
             rec = TraceRecorder(name="normal")

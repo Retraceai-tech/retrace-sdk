@@ -11,6 +11,7 @@
  */
 
 import { getResumable } from "./resume.js";
+import { getConfig } from "./config.js";
 import { AsyncLocalStorage } from "async_hooks";
 
 export interface CassetteEntry {
@@ -74,7 +75,30 @@ export function consumeCassetteEntry(name: string, spanType: string): CassetteEn
     }
   }
 
+  // Cassette MISS during an active replay: there is NO recorded entry for this call. Returning null
+  // makes the interceptor fall through to a REAL provider call (live cost + non-determinism). Never
+  // do that silently — warn (throttled), and fail closed if strictReplay is set.
+  reportCassetteMiss(name, spanType);
   return null;
+}
+
+const _missWarnedAt = new Map<string, number>();
+
+/** Throttled-warn (or throw, under strictReplay) on a cassette miss during replay. */
+function reportCassetteMiss(name: string, spanType: string): void {
+  if (getConfig().strictReplay) {
+    throw new Error(
+      `[retrace] Replay cassette MISS for ${spanType} "${name}": no recorded entry, and strictReplay is enabled — refusing to fall through to a real provider call. The recorded trace likely diverged (different call order/count).`,
+    );
+  }
+  const key = `${spanType}:${name}`;
+  const now = Date.now();
+  if (now - (_missWarnedAt.get(key) ?? 0) > 5000) {
+    _missWarnedAt.set(key, now);
+    console.warn(
+      `[retrace] Replay cassette MISS for ${spanType} "${name}" — no recorded entry; falling through to a REAL provider call (live cost + non-determinism). Set strictReplay:true (or RETRACE_STRICT_REPLAY=true) to fail closed instead.`,
+    );
+  }
 }
 
 /**

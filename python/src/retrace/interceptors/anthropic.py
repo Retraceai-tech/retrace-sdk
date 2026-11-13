@@ -1,22 +1,38 @@
 """Anthropic interceptor for Retrace Python SDK."""
+import threading
 import time
 import uuid
+from typing import Any, AsyncGenerator, Callable, Generator, Optional
 
+from ..pricing import UNKNOWN_MODEL_PRICING, cost_from_rate
+from ._dispatch import (
+    AsyncStreamProxy,
+    SyncStreamProxy,
+    capture_active_emit,
+    is_retrace_wrapper,
+    mark_retrace_wrapper,
+    register_open_span,
+    unregister_open_span,
+)
+from ._messages import recorded_messages
 from .tool_spans import (
     _parse_args,
+    anthropic_output_text,
     emit_anthropic_tool_calls,
     emit_anthropic_tool_results,
     extract_sampling_params,
     extract_tool_schemas,
-    reset_tool_result_dedup,
+    parsed_response,
 )
-from ..pricing import UNKNOWN_MODEL_PRICING, cost_from_rate
-from ._dispatch import capture_active_emit, register_open_span, unregister_open_span
 
-_original_create = None
-_original_async_create = None
+_original_create: Optional[Callable[..., Any]] = None
+_original_async_create: Optional[Callable[..., Any]] = None
 _installed = False
-_on_span = None
+# Serializes install/uninstall. Concurrent first calls used to install twice: the second install
+# captured the first one's wrapper as the "original", so every call recursed into itself until
+# RecursionError (pass 8). The patch is applied once, under this lock, and a wrapper is never wrapped.
+_install_lock = threading.RLock()
+_on_span: Optional[Callable[[dict[str, Any]], Any]] = None
 
 PRICING = {
     # Opus
@@ -43,32 +59,34 @@ def _calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return cost_from_rate(UNKNOWN_MODEL_PRICING, input_tokens, output_tokens)
 
 
-def _wrap_anthropic_stream(stream, span_id, model, messages, start):
+def _wrap_anthropic_stream(
+    stream: Any, span_id: str, model: str, messages: Any, start: float,
+) -> Generator[Any, None, None]:
     """Wrap Anthropic streaming response to collect text deltas and emit span."""
-    chunks = []
-    tool_acc: dict[int, dict] = {}
-    st = {"in_tok": 0, "out_tok": 0, "emitted": False}
+    chunks: list[str] = []
+    tool_acc: dict[int, dict[str, Any]] = {}
+    st: dict[str, Any] = {"in_tok": 0, "out_tok": 0, "emitted": False}
     # Bind the active sink + register a trace-end backstop: a stream finalized after its trace
     # context exits must still emit, not silently drop the span (parity with Gemini/TS).
     bound_emit = capture_active_emit() or _on_span
 
-    def finalize(reason):
+    def finalize(reason: str) -> None:
         if st["emitted"]:
             return
         st["emitted"] = True
         unregister_open_span(span_id)
         complete = reason == "complete"
-        output = "".join(chunks)
+        output = "".join(chunks) or anthropic_output_text([
+            {"type": "tool_use", "name": t.get("name"), "input": _parse_args(t.get("json", ""))}
+            for t in tool_acc.values()
+        ])
         if bound_emit:
             bound_emit({
                 "id": span_id,
                 "span_type": "llm_call",
                 "name": "anthropic.messages.create",
                 "model": model,
-                "input": {"messages": [
-                    {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                    for m in messages[:10]
-                ]},
+                "input": recorded_messages(messages),
                 "output": output[:2000],
                 "input_tokens": st["in_tok"],
                 "output_tokens": st["out_tok"],
@@ -91,7 +109,7 @@ def _wrap_anthropic_stream(stream, span_id, model, messages, start):
 
     register_open_span(span_id, finalize)
 
-    def _gen():
+    def _gen() -> Generator[Any, None, None]:
         try:
             for event in stream:
                 event_type = getattr(event, "type", "")
@@ -136,30 +154,32 @@ def _wrap_anthropic_stream(stream, span_id, model, messages, start):
     return _gen()
 
 
-def _wrap_anthropic_async_stream(stream, span_id, model, messages, start):
+def _wrap_anthropic_async_stream(
+    stream: Any, span_id: str, model: str, messages: Any, start: float,
+) -> AsyncGenerator[Any, None]:
     """Async counterpart of _wrap_anthropic_stream."""
-    chunks = []
-    tool_acc: dict[int, dict] = {}
-    st = {"in_tok": 0, "out_tok": 0, "emitted": False}
+    chunks: list[str] = []
+    tool_acc: dict[int, dict[str, Any]] = {}
+    st: dict[str, Any] = {"in_tok": 0, "out_tok": 0, "emitted": False}
     bound_emit = capture_active_emit() or _on_span
 
-    def finalize(reason):
+    def finalize(reason: str) -> None:
         if st["emitted"]:
             return
         st["emitted"] = True
         unregister_open_span(span_id)
         complete = reason == "complete"
-        output = "".join(chunks)
+        output = "".join(chunks) or anthropic_output_text([
+            {"type": "tool_use", "name": t.get("name"), "input": _parse_args(t.get("json", ""))}
+            for t in tool_acc.values()
+        ])
         if bound_emit:
             bound_emit({
                 "id": span_id,
                 "span_type": "llm_call",
                 "name": "anthropic.messages.create",
                 "model": model,
-                "input": {"messages": [
-                    {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                    for m in messages[:10]
-                ]},
+                "input": recorded_messages(messages),
                 "output": output[:2000],
                 "input_tokens": st["in_tok"],
                 "output_tokens": st["out_tok"],
@@ -182,7 +202,7 @@ def _wrap_anthropic_async_stream(stream, span_id, model, messages, start):
 
     register_open_span(span_id, finalize)
 
-    async def _agen():
+    async def _agen() -> AsyncGenerator[Any, None]:
         try:
             async for event in stream:
                 event_type = getattr(event, "type", "")
@@ -226,12 +246,16 @@ def _wrap_anthropic_async_stream(stream, span_id, model, messages, start):
     return _agen()
 
 
-def install_anthropic_interceptor(on_span=None):
+def install_anthropic_interceptor(on_span: Optional[Callable[[dict[str, Any]], Any]] = None) -> None:
+    with _install_lock:
+        _install_anthropic_interceptor_locked(on_span)
+
+
+def _install_anthropic_interceptor_locked(on_span: Optional[Callable[[dict[str, Any]], Any]] = None) -> None:
     global _original_create, _original_async_create, _installed, _on_span
     if _installed:
         if on_span:
             _on_span = on_span
-        reset_tool_result_dedup()
         return
 
     try:
@@ -240,10 +264,12 @@ def install_anthropic_interceptor(on_span=None):
         return
 
     _on_span = on_span
-    reset_tool_result_dedup()
+    if is_retrace_wrapper(Messages.create):
+        _installed = True
+        return
     _original_create = Messages.create
 
-    def patched_create(self, *args, **kwargs):
+    def patched_create(self: Any, *args: Any, **kwargs: Any) -> Any:
         from retrace.replay import consume_cassette_entry, is_replaying
 
         model = kwargs.get("model", "unknown")
@@ -275,15 +301,14 @@ def install_anthropic_interceptor(on_span=None):
 
             # Streaming: wrap iterator to collect chunks and emit span on completion
             if is_streaming and hasattr(result, "__iter__"):
-                return _wrap_anthropic_stream(result, span_id, model, messages, start)
+                return SyncStreamProxy(result, _wrap_anthropic_stream(result, span_id, model, messages, start))
 
             duration_ms = int((time.time() - start) * 1000)
-            usage = getattr(result, "usage", None)
+            parsed = parsed_response(result)  # a raw-response wrapper → the message
+            usage = getattr(parsed, "usage", None)
             input_tokens = getattr(usage, "input_tokens", 0) or 0
             output_tokens = getattr(usage, "output_tokens", 0) or 0
-            output = ""
-            if hasattr(result, "content") and result.content:
-                output = getattr(result.content[0], "text", "") if result.content else ""
+            output = anthropic_output_text(getattr(parsed, "content", None))
 
             if _on_span:
                 _on_span({
@@ -291,10 +316,7 @@ def install_anthropic_interceptor(on_span=None):
                     "span_type": "llm_call",
                     "name": "anthropic.messages.create",
                     "model": model,
-                    "input": {"messages": [
-                        {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                        for m in messages[:10]
-                    ]},
+                    "input": recorded_messages(messages),
                     "output": output[:2000],
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -308,7 +330,7 @@ def install_anthropic_interceptor(on_span=None):
                 })
                 # Auto-capture tool usage (tool_use blocks in response, tool_result in input)
                 emit_anthropic_tool_results(messages, _on_span)
-                emit_anthropic_tool_calls(getattr(result, "content", None), span_id, model, _on_span)
+                emit_anthropic_tool_calls(getattr(parsed, "content", None), span_id, model, _on_span)
             return result
         except Exception as e:
             duration_ms = int((time.time() - start) * 1000)
@@ -318,24 +340,22 @@ def install_anthropic_interceptor(on_span=None):
                     "span_type": "llm_call",
                     "name": "anthropic.messages.create",
                     "model": model,
-                    "input": {"messages": [
-                        {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                        for m in messages[:10]
-                    ]},
+                    "input": recorded_messages(messages),
                     "duration_ms": duration_ms,
                     "error": str(e),
                 })
             raise
 
-    Messages.create = patched_create
+    mark_retrace_wrapper(patched_create)
+    setattr(Messages, "create", patched_create)
 
     # Async client instrumentation (AsyncAnthropic).
     try:
         from anthropic.resources.messages import AsyncMessages
-        if _original_async_create is None:
+        if _original_async_create is None and not is_retrace_wrapper(AsyncMessages.create):
             _original_async_create = AsyncMessages.create
 
-        async def patched_async_create(self, *args, **kwargs):
+        async def patched_async_create(self: Any, *args: Any, **kwargs: Any) -> Any:
             from retrace.replay import consume_cassette_entry, is_replaying
 
             model = kwargs.get("model", "unknown")
@@ -361,26 +381,27 @@ def install_anthropic_interceptor(on_span=None):
 
             start = time.time()
             try:
-                result = await _original_async_create(self, *args, **kwargs)
+                original = _original_async_create
+                if original is None:  # installed only after the original was captured
+                    raise RuntimeError("retrace: async interceptor has no original method")
+                result = await original(self, *args, **kwargs)
                 if is_streaming and hasattr(result, "__aiter__"):
-                    return _wrap_anthropic_async_stream(result, span_id, model, messages, start)
+                    return AsyncStreamProxy(
+                        result, _wrap_anthropic_async_stream(result, span_id, model, messages, start)
+                    )
                 duration_ms = int((time.time() - start) * 1000)
-                usage = getattr(result, "usage", None)
+                parsed = parsed_response(result)  # a raw-response wrapper → the message
+                usage = getattr(parsed, "usage", None)
                 input_tokens = getattr(usage, "input_tokens", 0) or 0
                 output_tokens = getattr(usage, "output_tokens", 0) or 0
-                output = ""
-                if hasattr(result, "content") and result.content:
-                    output = getattr(result.content[0], "text", "") if result.content else ""
+                output = anthropic_output_text(getattr(parsed, "content", None))
                 if _on_span:
                     _on_span({
                         "id": span_id,
                         "span_type": "llm_call",
                         "name": "anthropic.messages.create",
                         "model": model,
-                        "input": {"messages": [
-                            {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                            for m in messages[:10]
-                        ]},
+                        "input": recorded_messages(messages),
                         "output": output[:2000],
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
@@ -392,7 +413,7 @@ def install_anthropic_interceptor(on_span=None):
                         } or None,
                     })
                     emit_anthropic_tool_results(messages, _on_span)
-                    emit_anthropic_tool_calls(getattr(result, "content", None), span_id, model, _on_span)
+                    emit_anthropic_tool_calls(getattr(parsed, "content", None), span_id, model, _on_span)
                 return result
             except Exception as e:
                 duration_ms = int((time.time() - start) * 1000)
@@ -402,35 +423,40 @@ def install_anthropic_interceptor(on_span=None):
                         "span_type": "llm_call",
                         "name": "anthropic.messages.create",
                         "model": model,
-                        "input": {"messages": [
-                            {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                            for m in messages[:10]
-                        ]},
+                        "input": recorded_messages(messages),
                         "duration_ms": duration_ms,
                         "error": str(e),
                     })
                 raise
 
-        AsyncMessages.create = patched_async_create
+        # Already ours (the module globals were reset by a reload): leave the existing patch.
+        if not is_retrace_wrapper(AsyncMessages.create):
+            mark_retrace_wrapper(patched_async_create)
+            setattr(AsyncMessages, "create", patched_async_create)
     except ImportError:
         pass
 
     _installed = True
 
 
-def uninstall_anthropic_interceptor():
+def uninstall_anthropic_interceptor() -> None:
+    with _install_lock:
+        _uninstall_anthropic_interceptor_locked()
+
+
+def _uninstall_anthropic_interceptor_locked() -> None:
     global _installed, _on_span, _original_create
     if not _installed or not _original_create:
         return
     try:
         from anthropic.resources.messages import Messages
-        Messages.create = _original_create
+        setattr(Messages, "create", _original_create)
     except ImportError:
         pass
     try:
         if _original_async_create is not None:
             from anthropic.resources.messages import AsyncMessages
-            AsyncMessages.create = _original_async_create
+            setattr(AsyncMessages, "create", _original_async_create)
     except ImportError:
         pass
     _installed = False

@@ -1,9 +1,11 @@
 import { SpanData, SpanType } from "../trace.js";
+import { recordedMessages } from "./messages.js";
 import { genId, nowIso, truncateJson, wasTruncated } from "../utils.js";
 import { isReplaying, consumeCassetteEntry } from "../replay.js";
-import { emitAnthropicToolCalls, emitAnthropicToolResults, parseToolArgs, resetToolResultDedup, extractToolSchemas, extractSamplingParams } from "./tool-spans.js";
+import { emitAnthropicToolCalls, emitAnthropicToolResults, parseToolArgs, extractToolSchemas, extractSamplingParams, anthropicOutputText } from "./tool-spans.js";
 import { dispatchRegisterOpenSpan, dispatchUnregisterOpenSpan } from "./_dispatch.js";
 import { UNKNOWN_MODEL_PRICING, costFromRate } from "../pricing.js";
+import { createProviderPatcher, pathOf, type PatchablePrototype } from "./provider-modules.js";
 
 const PRICING: Record<string, [number, number]> = {
   "claude-opus-4.7": [5.0, 25.0],
@@ -25,36 +27,33 @@ function calcCost(model: string, inputTokens: number, outputTokens: number): num
   return costFromRate(UNKNOWN_MODEL_PRICING, inputTokens, outputTokens);
 }
 
-let originalCreate: ((...args: unknown[]) => unknown) | null = null;
-let installed = false;
-// Set SYNCHRONOUSLY before the async import() so a second concurrent install can't double-wrap the
-// prototype. (`installed` is set inside the .then() and is therefore too late to guard the race.)
-let installStarted = false;
 let onSpanCallback: ((span: SpanData) => void) | null = null;
 
-export function installAnthropicInterceptor(onSpan: (span: SpanData) => void) {
-  // Always refresh the active callback; the prototype PATCH must happen at most once (a synchronous
-  // guard so two concurrent installs can't both patch and double-wrap create() → doubled spans).
-  onSpanCallback = onSpan;
-  resetToolResultDedup();
-  if (installStarted) return;
-  installStarted = true;
-
-  import("@anthropic-ai/sdk").then((anthropicMod) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mod = anthropicMod as any;
-    const Anthropic = mod?.Anthropic || mod?.default;
-    if (!Anthropic) return;
-    // Find Messages prototype without instantiating a client
-    const proto = Anthropic.Messages?.prototype || Anthropic.prototype?.messages?.constructor?.prototype;
-    if (!proto?.create) return;
-    originalCreate = proto.create;
-    proto.create = createPatchedCreate();
-    installed = true;
-  }).catch(() => { installStarted = false; });
+/** Messages.prototype in one loaded copy (ES or CommonJS build) of @anthropic-ai/sdk, found without instantiating a client. */
+function messagesPrototype(mod: unknown): PatchablePrototype | null {
+  const Anthropic = pathOf(mod, "Anthropic") ?? pathOf(mod, "default");
+  const proto = pathOf(Anthropic, "Messages", "prototype") ?? pathOf(Anthropic, "prototype", "messages", "constructor", "prototype");
+  return typeof pathOf(proto, "create") === "function" ? (proto as PatchablePrototype) : null;
 }
 
-function createPatchedCreate() {
+const patcher = createProviderPatcher({
+  specifier: "@anthropic-ai/sdk",
+  load: () => import("@anthropic-ai/sdk"),
+  find: messagesPrototype,
+  methods: ["create"],
+  wrap: (_method, original) => createPatchedCreate(original),
+});
+
+/**
+ * Patches `messages.create` in every loaded copy of @anthropic-ai/sdk. Always refreshes the active
+ * callback; each prototype is patched at most once (no double-wrapped create() → doubled spans).
+ */
+export function installAnthropicInterceptor(onSpan: (span: SpanData) => void): Promise<void> {
+  onSpanCallback = onSpan;
+  return patcher.install();
+}
+
+function createPatchedCreate(originalCreate: (...args: unknown[]) => unknown) {
   return async function (this: unknown, ...args: unknown[]) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const opts = (args[0] as Record<string, any>) || {};
@@ -76,7 +75,7 @@ function createPatchedCreate() {
         const span: SpanData = {
           id: spanId, trace_id: "", parent_id: null,
           span_type: SpanType.LLM_CALL, name: "anthropic.messages.create", model,
-          input: truncateJson({ messages: messages.slice(0, 10) }),
+          input: recordedMessages(messages),
           output: truncateJson(output),
           duration_ms: 0, started_at: startedAt, ended_at: nowIso(),
           metadata: { replayed: true },
@@ -92,7 +91,7 @@ function createPatchedCreate() {
     }
 
     try {
-      const result = await originalCreate!.apply(this, args);
+      const result = await originalCreate.apply(this, args);
 
       // Streaming: Anthropic returns an async iterable of MessageStreamEvent
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -117,7 +116,7 @@ function createPatchedCreate() {
           const span: SpanData = {
             id: spanId, trace_id: "", parent_id: null,
             span_type: SpanType.LLM_CALL, name: "anthropic.messages.create", model,
-            input: truncateJson({ messages: messages.slice(0, 10) }),
+            input: recordedMessages(messages),
             output: truncateJson(output),
             input_tokens: inputTokens, output_tokens: outputTokens,
             cost: calcCost(model, inputTokens, outputTokens),
@@ -178,12 +177,12 @@ function createPatchedCreate() {
       const res = result as any;
       const inputTokens = res?.usage?.input_tokens || 0;
       const outputTokens = res?.usage?.output_tokens || 0;
-      const output = res?.content?.[0]?.text || "";
+      const output = anthropicOutputText(res?.content);
 
       const span: SpanData = {
         id: spanId, trace_id: "", parent_id: null,
         span_type: SpanType.LLM_CALL, name: "anthropic.messages.create", model,
-        input: truncateJson({ messages: messages.slice(0, 10) }),
+        input: recordedMessages(messages),
         output: truncateJson(output),
         input_tokens: inputTokens, output_tokens: outputTokens,
         cost: calcCost(model, inputTokens, outputTokens),
@@ -201,7 +200,7 @@ function createPatchedCreate() {
       const span: SpanData = {
         id: spanId, trace_id: "", parent_id: null,
         span_type: SpanType.LLM_CALL, name: "anthropic.messages.create", model,
-        input: truncateJson({ messages: messages.slice(0, 10) }),
+        input: recordedMessages(messages),
         started_at: startedAt, ended_at: nowIso(),
         duration_ms: Date.now() - startMs,
         error: err instanceof Error ? err.message : String(err),
@@ -213,15 +212,6 @@ function createPatchedCreate() {
 }
 
 export function uninstallAnthropicInterceptor() {
-  if (!installed || !originalCreate) return;
-  import("@anthropic-ai/sdk").then((anthropicMod) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mod = anthropicMod as any;
-    const Anthropic = mod?.Anthropic || mod?.default;
-    if (!Anthropic) return;
-    const proto = Anthropic.Messages?.prototype;
-    if (proto) proto.create = originalCreate;
-  }).catch(() => {});
-  installed = false;
+  patcher.uninstall();
   onSpanCallback = null;
 }

@@ -21,10 +21,12 @@ money, do not wrap with ``stream()``.
 """
 from __future__ import annotations
 
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, TypeVar
+
+_T = TypeVar("_T")
 
 
-def stream(src: Iterable) -> Iterator:
+def stream(src: Iterable[_T]) -> Iterator[_T]:
     it = iter(src)
     drained_to_end = False
     try:

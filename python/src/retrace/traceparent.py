@@ -5,8 +5,8 @@ Format: 00-{trace_id_32hex}-{parent_id_16hex}-{flags_2hex}
 When a traced function makes HTTP calls, inject the traceparent header
 so downstream services can correlate their spans with the parent trace.
 """
-from typing import Dict, Optional, Tuple
 import contextvars
+from typing import Dict, Optional, Tuple
 
 # Per-context trace context (mirrors the _dispatch ContextVar). Each thread / async task resolves
 # its own value, so concurrent traces can't leak context into one another's outbound requests.
@@ -15,12 +15,12 @@ _trace_ctx: contextvars.ContextVar[Optional[Tuple[str, str]]] = contextvars.Cont
 )
 
 
-def set_trace_context(trace_id: str, span_id: str):
+def set_trace_context(trace_id: str, span_id: str) -> contextvars.Token[Optional[Tuple[str, str]]]:
     """Set the active trace context for outgoing requests. Returns a token for reset()."""
     return _trace_ctx.set((trace_id.replace("-", ""), span_id.replace("-", "")[:16]))
 
 
-def clear_trace_context(token=None) -> None:
+def clear_trace_context(token: Optional[contextvars.Token[Optional[Tuple[str, str]]]] = None) -> None:
     """Clear the active trace context. Pass the token from set_trace_context to restore the
     enclosing context (supports nesting); otherwise the context is cleared outright."""
     if token is not None:

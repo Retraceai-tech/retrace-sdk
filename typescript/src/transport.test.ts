@@ -1,26 +1,35 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { configure } from "./config.js";
 
-// Mock WebSocket to never connect (simulates unreachable WS endpoint)
-const mockWsInstances: Array<Record<string, unknown>> = [];
-vi.mock("ws", () => {
-  const MockWebSocket = function (this: Record<string, unknown>) {
-    this.readyState = 0;
-    this._listeners = {} as Record<string, Array<() => void>>;
-    this.on = (event: string, cb: () => void) => { ((this._listeners as Record<string, Array<() => void>>)[event] ??= []).push(cb); return this; };
-    this.send = vi.fn();
-    this.close = vi.fn(() => {
-      this.readyState = 3;
-      for (const cb of ((this._listeners as Record<string, Array<() => void>>)["close"] ?? [])) cb();
+// The production transport prefers globalThis.WebSocket and consumes the DOM addEventListener API, so
+// the test double implements THAT interface (not the `ws` package's .on()) and is installed as the
+// global WebSocket. It never transitions to OPEN — simulating an unreachable endpoint — so connect()
+// stays pending and the close()/HTTP-fallback paths can be exercised with no real socket.
+const { MockWebSocket, mockWsInstances } = vi.hoisted(() => {
+  const instances: Array<Record<string, unknown>> = [];
+  class MockWebSocket {
+    static OPEN = 1;
+    readyState = 0;            // CONNECTING — never fires "open"
+    bufferedAmount = 0;
+    private listeners: Record<string, Array<(ev?: unknown) => void>> = {};
+    constructor(_url?: string) { instances.push(this as unknown as Record<string, unknown>); }
+    addEventListener(event: string, cb: (ev?: unknown) => void) { (this.listeners[event] ??= []).push(cb); }
+    send = vi.fn();
+    close = vi.fn(function (this: MockWebSocket) {
+      this.readyState = 3;     // CLOSED
+      for (const cb of (this.listeners["close"] ?? [])) cb();
     });
-    mockWsInstances.push(this);
-  } as unknown as { new(): Record<string, unknown>; OPEN: number };
-  MockWebSocket.OPEN = 1;
-  return { default: MockWebSocket };
+  }
+  return { MockWebSocket, mockWsInstances: instances };
 });
+// Older runtimes without a global WebSocket resolve the same double via the optional `ws` import.
+vi.mock("ws", () => ({ default: MockWebSocket }));
 
 beforeEach(() => {
-  configure({ apiKey: "rt_live_test", baseUrl: "http://localhost:3001", enabled: true });
+  configure({ apiKey: "rt_test", baseUrl: "http://localhost:3001", enabled: true });
+  // Force resolveWebSocketCtor onto the controllable double so no real undici socket is opened to
+  // localhost during the unit test (Node ships a global WebSocket, which the transport prefers).
+  vi.stubGlobal("WebSocket", MockWebSocket);
   mockWsInstances.length = 0;
 });
 
@@ -45,9 +54,13 @@ describe("Auto transport fallback on early close()", () => {
     // Close immediately — WS has NOT connected yet
     transport.close();
 
-    // Should have fallen back to HTTP and flushed
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    const [url, opts] = mockFetch.mock.calls[0];
+    // Should have fallen back to HTTP and flushed the trace exactly once. Filter to the trace-upload
+    // endpoint: configure() also fires an always-on anonymous telemetry ping (POST
+    // /api/v1/internal/logs) whose deferred dynamic-import lands on this same mock, so asserting the
+    // TOTAL fetch count would spuriously see 2. Scope to the endpoint under test.
+    const traceCalls = mockFetch.mock.calls.filter(([u]) => String(u).endsWith("/api/v1/traces"));
+    expect(traceCalls).toHaveLength(1);
+    const [url, opts] = traceCalls[0];
     expect(url).toBe("http://localhost:3001/api/v1/traces");
     const body = JSON.parse(opts.body);
     expect(body.id).toBe("t1");
@@ -62,6 +75,11 @@ describe("Auto transport fallback on early close()", () => {
     const { WSTransport } = await import("./transport.js");
     const ws = new WSTransport();
     ws.connect();
+
+    // connect() resolves the WebSocket constructor via a dynamic import("ws") (async, for
+    // edge-runtime compat), so the socket is created on a later microtask. Poll for it instead of a
+    // fixed sleep: under a loaded parallel test run the first import can take longer than 50ms.
+    await vi.waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0), { timeout: 5000 });
 
     // Should have created a WS instance
     expect(mockWsInstances.length).toBeGreaterThan(0);

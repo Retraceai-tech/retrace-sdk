@@ -58,6 +58,11 @@ export function runWithActiveRecorder<T>(cb: SpanCallback, fn: () => T, sink?: O
   return activeRecorder.run(cb, fn);
 }
 
+/** The open-span sink of the trace() run active in this async context (its recorder), if any. */
+export function currentContextSink(): OpenSpanSink | undefined {
+  return activeOpenSink.getStore();
+}
+
 /** Set the imperative-API fallback handler. Returns the PREVIOUS handler so callers can restore
  * it (e.g. a nested trace() must not wipe the ambient init() fallback). Pass null to clear. */
 export function setActiveRecorderFallback(cb: SpanCallback | null, sink?: OpenSpanSink | null): SpanCallback | null {

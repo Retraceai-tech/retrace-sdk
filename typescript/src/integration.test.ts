@@ -9,7 +9,7 @@ import { SpanType, TraceStatus } from "./trace.js";
 import type { SpanData, TraceData } from "./trace.js";
 
 beforeEach(() => {
-  configure({ apiKey: "rt_live_integration", baseUrl: "http://localhost:3001", wsUrl: "", projectId: undefined, enabled: true });
+  configure({ apiKey: "rt_integration", baseUrl: "http://localhost:3001", wsUrl: "", projectId: undefined, enabled: true });
 });
 
 // ─── TYPE TESTS (compile-time verification) ────────────────────────────────
@@ -49,6 +49,7 @@ describe("Type Safety", () => {
     rec.start();
     const data = rec.builder.toDict();
     expect(data.name).toBe("typed");
+    rec.end();
   });
 });
 
@@ -84,6 +85,7 @@ describe("API Contract", () => {
     expect(s.started_at).toBeDefined();
     expect(s.input).toEqual({ messages: [] });
     expect(s.output).toBe("response");
+    rec.end();
   });
 
   it("trace function wrapper works", () => {

@@ -27,7 +27,11 @@ export async function createLangChainHandler(recorder?: TraceRecorder): Promise<
   }
 
   const open = new Map<string, SpanBuilder>();
-  const rec = (): TraceRecorder | null => recorder ?? getActiveRecorder();
+  // Bind the recorder of the trace() run this handler was created in. LangChain can deliver callbacks
+  // outside that async context, and the adapter used to look only at the ambient init() trace, so a
+  // handler created inside trace() recorded nothing (autoTrace off) or into the ambient trace.
+  const bound = recorder ?? getActiveRecorder();
+  const rec = (): TraceRecorder | null => bound ?? getActiveRecorder();
 
   class RetraceHandler extends BaseCallbackHandler {
     name = "retrace";

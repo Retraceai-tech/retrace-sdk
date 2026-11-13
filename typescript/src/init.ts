@@ -2,6 +2,7 @@ import { configure, getConfig, requireApiKey, type Config } from "./config.js";
 import { TraceRecorder, drainSharedTransportOnExit } from "./recorder.js";
 import { onProcessExit } from "./transport.js";
 import { TraceStatus } from "./trace.js";
+import { currentContextSink } from "./interceptors/_dispatch.js";
 
 let ambient: TraceRecorder | null = null;
 let exitHooked = false;
@@ -55,10 +56,10 @@ export function init(opts: InitOptions = {}): TraceRecorder | null {
 
   if (!exitHooked && typeof process !== "undefined") {
     exitHooked = true;
-    const finish = (status: TraceStatus, terminatedEarly = false) => {
+    const finish = (status: TraceStatus, terminatedEarly = false, error?: unknown) => {
       const rec = ambient;
       ambient = null;
-      try { rec?.end(undefined, status, { terminatedEarly }); } catch { /* best effort on shutdown */ }
+      try { rec?.end(undefined, status, { terminatedEarly, error }); } catch { /* best effort on shutdown */ }
     };
     // Finish the ambient trace as a pre-exit hook: registerProcessExitFlush (in recorder.ts) runs
     // this BEFORE draining the transport, so the final trace_ended is in the buffer for the
@@ -76,7 +77,7 @@ export function init(opts: InitOptions = {}): TraceRecorder | null {
     // exit non-zero): finish FAILED + terminated_early, drain best-effort within a hard cap, then exit.
     process.once("uncaughtException", (err) => {
       console.error(err);
-      finish(TraceStatus.FAILED, true);
+      finish(TraceStatus.FAILED, true, err);
       void Promise.race([
         drainSharedTransportOnExit(1500).catch(() => {}),
         new Promise((r) => setTimeout(r, 3000)),
@@ -86,9 +87,15 @@ export function init(opts: InitOptions = {}): TraceRecorder | null {
   return ambient;
 }
 
-/** The ambient recorder started by {@link init}, if any. */
+/**
+ * The recorder of the `trace()` run active in this async context, else the ambient recorder started
+ * by {@link init}. The framework adapters (LangChain, Vercel AI) record into it; they used to see only
+ * the ambient trace, so their spans were lost inside `trace()` with `autoTrace: false`, or landed in
+ * the ambient trace instead of the run.
+ */
 export function getActiveRecorder(): TraceRecorder | null {
-  return ambient;
+  const sink = currentContextSink();
+  return sink instanceof TraceRecorder ? sink : ambient;
 }
 
 /** Manually end the ambient trace (e.g. with a final output) before process exit. Idempotent. */

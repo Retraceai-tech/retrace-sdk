@@ -34,6 +34,14 @@ def test_replay_cassette_is_context_isolated():
 
 
 def test_consume_cassette_entry_matches_by_name_and_type():
+    from retrace.config import get_config
+    cfg = get_config()
+    prev_strict = cfg.strict_replay
+    # This test exercises the cassette match + EXHAUSTION path, where a miss returns None and the
+    # interceptor falls through. That fall-through only applies under the non-strict mode; the default
+    # strict_replay=True (correctly) RAISES on a miss to fail closed. Opt into non-strict for the
+    # exhaustion assertion and restore afterwards so the default isn't leaked to other tests.
+    cfg.strict_replay = False
     replay.activate_cassette([
         {"name": "openai.chat.completions.create", "span_type": "llm_call", "output": "hi"},
     ])
@@ -44,3 +52,4 @@ def test_consume_cassette_entry_matches_by_name_and_type():
         assert replay.consume_cassette_entry("openai.chat.completions.create", "llm_call") is None
     finally:
         replay.deactivate_cassette()
+        cfg.strict_replay = prev_strict

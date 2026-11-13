@@ -1,7 +1,6 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   parseToolArgs,
-  resetToolResultDedup,
   emitOpenAIToolCalls,
   emitOpenAIToolResults,
   emitAnthropicToolCalls,
@@ -18,7 +17,6 @@ function collector() {
 }
 
 describe("tool-span extraction (Phase 1C)", () => {
-  beforeEach(() => resetToolResultDedup());
 
   it("parseToolArgs parses JSON strings into structured objects, leaves objects untouched", () => {
     expect(parseToolArgs('{"a":1,"b":"x"}')).toEqual({ a: 1, b: "x" });
@@ -64,18 +62,15 @@ describe("tool-span extraction (Phase 1C)", () => {
     expect(tr.spans[0].metadata).toMatchObject({ tool_call_id: "call_1" });
   });
 
-  it("OpenAI: tool_result spans are deduped across repeated requests (no double-count)", () => {
+  it("OpenAI: every tool message is emitted with its tool_call_id (the recorder dedupes per trace)", () => {
     const messages = [
       { role: "assistant", tool_calls: [{ id: "c1", function: { name: "t", arguments: "{}" } }] },
       { role: "tool", tool_call_id: "c1", content: "ok" },
     ];
     const a = collector();
     emitOpenAIToolResults(messages, a.emit);
-    expect(a.spans).toHaveLength(1);
-    // Same tool message present again on the next turn → must NOT re-emit
-    const b = collector();
-    emitOpenAIToolResults(messages, b.emit);
-    expect(b.spans).toHaveLength(0);
+    emitOpenAIToolResults(messages, a.emit);
+    expect(a.spans.map((s) => (s.metadata as { tool_call_id: string }).tool_call_id)).toEqual(["c1", "c1"]);
   });
 
   it("OpenAI: a tool result containing an error is flagged as an error span", () => {

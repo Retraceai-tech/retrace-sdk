@@ -7,7 +7,7 @@ import { configure } from "./config.js";
 // a no-op mock — these tests touch NO real network while exercising the real trace()/recorder paths.
 beforeAll(() => {
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, text: async () => "" })));
-  configure({ apiKey: "rt_live_testkey", transport: "http", baseUrl: "http://127.0.0.1:0" });
+  configure({ apiKey: "rt_testkey", transport: "http", baseUrl: "http://127.0.0.1:0" });
 });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

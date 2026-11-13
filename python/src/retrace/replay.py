@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -32,7 +33,9 @@ logger = logging.getLogger("retrace")
 # replay (run on its own thread/task by handle_replay) is isolated to that execution context
 # and can NEVER cause a concurrent live LLM call on another thread/task to return recorded
 # output. A module global here would hijack the user's real production calls.
-_cassette_var: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar("retrace_replay_cassette", default=None)
+_cassette_var: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = contextvars.ContextVar(
+    "retrace_replay_cassette", default=None
+)
 _pointer_var: contextvars.ContextVar[int] = contextvars.ContextVar("retrace_replay_pointer", default=0)
 
 
@@ -42,7 +45,7 @@ class ReplayCommand:
     trace_id: str
     trace_name: str
     input: Any
-    cassette: list[dict]
+    cassette: list[dict[str, Any]]
 
 
 def is_replaying() -> bool:
@@ -50,7 +53,7 @@ def is_replaying() -> bool:
     return _cassette_var.get() is not None
 
 
-def activate_cassette(cassette: list) -> None:
+def activate_cassette(cassette: list[dict[str, Any]]) -> None:
     """Activate a cassette for the current execution context (the replay thread/task only)."""
     _cassette_var.set(cassette)
     _pointer_var.set(0)
@@ -62,7 +65,7 @@ def deactivate_cassette() -> None:
     _pointer_var.set(0)
 
 
-def consume_cassette_entry(name: str, span_type: str) -> Optional[dict]:
+def consume_cassette_entry(name: str, span_type: str) -> Optional[dict[str, Any]]:
     """Get the next cassette entry matching a span name and type.
 
     Uses sequential matching with name-based fallback for deterministic replay.
@@ -87,7 +90,36 @@ def consume_cassette_entry(name: str, span_type: str) -> Optional[dict]:
             _pointer_var.set(i + 1)
             return cassette[i]
 
+    # Cassette MISS during an active replay: no recorded entry for this call. Returning None makes
+    # the interceptor fall through to a REAL provider call (live cost + non-determinism). Never do
+    # that silently — warn (throttled), and fail closed if strict_replay is set.
+    _report_cassette_miss(name, span_type)
     return None
+
+
+_miss_warned_at: dict[str, float] = {}
+
+
+def _report_cassette_miss(name: str, span_type: str) -> None:
+    """Throttled-warn (or raise, under strict_replay) on a cassette miss during replay."""
+    from .config import get_config
+
+    if get_config().strict_replay:
+        raise RuntimeError(
+            f"[retrace] Replay cassette MISS for {span_type} '{name}': no recorded entry, and "
+            f"strict_replay is enabled — refusing to fall through to a real provider call. The "
+            f"recorded trace likely diverged (different call order/count)."
+        )
+    key = f"{span_type}:{name}"
+    now = time.monotonic()
+    if now - _miss_warned_at.get(key, 0.0) > 5.0:
+        _miss_warned_at[key] = now
+        logger.warning(
+            "[retrace] Replay cassette MISS for %s '%s' — no recorded entry; falling through to a "
+            "REAL provider call (live cost + non-determinism). Set strict_replay=True (or "
+            "RETRACE_STRICT_REPLAY=true) to fail closed instead.",
+            span_type, name,
+        )
 
 
 def handle_replay(command: ReplayCommand) -> bool:
@@ -100,7 +132,7 @@ def handle_replay(command: ReplayCommand) -> bool:
         logger.warning(f"[retrace] No resumable function registered for '{command.trace_name}'")
         return False
 
-    def _run():
+    def _run() -> None:
         try:
             from .recorder import TraceRecorder
             from .trace import TraceStatus
@@ -140,7 +172,7 @@ def handle_replay(command: ReplayCommand) -> bool:
     return True
 
 
-def parse_replay_message(msg: dict) -> Optional[ReplayCommand]:
+def parse_replay_message(msg: dict[str, Any]) -> Optional[ReplayCommand]:
     """Parse a WebSocket message into a ReplayCommand."""
     if msg.get("type") != "replay":
         return None

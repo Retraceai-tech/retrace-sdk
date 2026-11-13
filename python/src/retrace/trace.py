@@ -36,15 +36,19 @@ class Span:
     output_tokens: Optional[int] = None
     cost: Optional[float] = None
     duration_ms: Optional[int] = None
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    # Multi-agent attribution. CANONICAL contract: @retrace/shared AgentSpanFieldsSchema
+    # (packages/shared/src/agents.ts) — keep these field names in sync (MA-SDK-001).
     agent_id: Optional[str] = None
+    parent_agent_id: Optional[str] = None
+    agent_role: Optional[str] = None
     started_at: Optional[datetime] = field(default_factory=utcnow)
     ended_at: Optional[datetime] = None
     error: Optional[str] = None
-    token_ids: Optional[list] = None
-    logprobs: Optional[list] = None
+    token_ids: Optional[list[int]] = None
+    logprobs: Optional[list[float]] = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "id": self.id,
             "trace_id": self.trace_id,
@@ -71,6 +75,10 @@ class Span:
             d["metadata"] = self.metadata
         if self.agent_id:
             d["agent_id"] = self.agent_id
+        if self.parent_agent_id:
+            d["parent_agent_id"] = self.parent_agent_id
+        if self.agent_role:
+            d["agent_role"] = self.agent_role
         if self.ended_at:
             d["ended_at"] = self.ended_at.isoformat().replace("+00:00", "Z")
         if self.error:
@@ -92,14 +100,20 @@ class Trace:
     total_tokens: int = 0
     total_cost: float = 0.0
     total_duration_ms: int = 0
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     session_id: Optional[str] = None
     started_at: Optional[datetime] = field(default_factory=utcnow)
     ended_at: Optional[datetime] = None
-    spans: list = field(default_factory=list)
+    spans: list[Span] = field(default_factory=list)
     project_id: Optional[str] = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
+        # Tag the run's environment (e.g. "sandbox") from config as metadata.environment so the
+        # server routes it to the matching data-namespace. Explicit metadata.environment wins.
+        from .config import get_config
+        _env = get_config().environment
+        if _env and "environment" not in self.metadata:
+            self.metadata = {**self.metadata, "environment": _env}
         d: dict[str, Any] = {
             "id": self.id,
             "status": self.status.value,

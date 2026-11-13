@@ -1,8 +1,11 @@
+from .agents import agent, current_agent
+from .cassette import write_golden_cassette
 from .config import configure, get_config
 from .errors import (
     RetraceAuthError,
     RetraceConnectionError,
     RetraceCreditsExhaustedError,
+    RetraceEnforcementError,
     RetraceError,
     RetraceRateLimitError,
 )
@@ -16,18 +19,20 @@ from .replay import consume_cassette_entry, is_replaying
 from .stream import stream
 from .trace import Span, SpanType, Trace, TraceStatus
 
-__version__ = "0.16.0"
+__version__ = "0.16.25"
 __all__ = [
     "configure", "get_config",
     "init", "get_active_recorder", "shutdown",
     "record", "TraceRecorder", "stream",
+    "agent", "current_agent",
     "Span", "Trace", "SpanType", "TraceStatus",
     "RetraceError", "RetraceAuthError", "RetraceCreditsExhaustedError",
-    "RetraceConnectionError", "RetraceRateLimitError",
+    "RetraceConnectionError", "RetraceRateLimitError", "RetraceEnforcementError",
     "install_gemini_interceptor", "uninstall_gemini_interceptor",
     "install_openai_interceptor", "uninstall_openai_interceptor",
     "install_anthropic_interceptor", "uninstall_anthropic_interceptor",
     "is_replaying", "consume_cassette_entry",
     "mark_golden",
+    "write_golden_cassette",
 ]
 # trigger

@@ -1,22 +1,38 @@
 """OpenAI interceptor for Retrace Python SDK."""
+import threading
 import time
 import uuid
+from typing import Any, AsyncGenerator, Callable, Generator, Optional
 
+from ..pricing import UNKNOWN_MODEL_PRICING, cost_from_rate
+from ._dispatch import (
+    AsyncStreamProxy,
+    SyncStreamProxy,
+    capture_active_emit,
+    is_retrace_wrapper,
+    mark_retrace_wrapper,
+    register_open_span,
+    unregister_open_span,
+)
+from ._messages import recorded_messages
 from .tool_spans import (
     _parse_args,
     emit_openai_tool_calls,
     emit_openai_tool_results,
     extract_sampling_params,
     extract_tool_schemas,
-    reset_tool_result_dedup,
+    openai_output_text,
+    parsed_response,
 )
-from ._dispatch import capture_active_emit, register_open_span, unregister_open_span
-from ..pricing import UNKNOWN_MODEL_PRICING, cost_from_rate
 
-_original_create = None
-_original_async_create = None
+_original_create: Optional[Callable[..., Any]] = None
+_original_async_create: Optional[Callable[..., Any]] = None
 _installed = False
-_on_span = None
+# Serializes install/uninstall. Concurrent first calls used to install twice: the second install
+# captured the first one's wrapper as the "original", so every call recursed into itself until
+# RecursionError (pass 8). The patch is applied once, under this lock, and a wrapper is never wrapped.
+_install_lock = threading.RLock()
+_on_span: Optional[Callable[[dict[str, Any]], Any]] = None
 
 PRICING = {
     # GPT-5.5 series
@@ -53,34 +69,36 @@ def _calc_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return cost_from_rate(UNKNOWN_MODEL_PRICING, input_tokens, output_tokens)
 
 
-def _wrap_stream(stream, span_id, model, messages, start, tool_schemas=None, sampling=None):
+def _wrap_stream(
+    stream: Any, span_id: str, model: str, messages: Any, start: float,
+    tool_schemas: Optional[dict[str, Any]] = None, sampling: Optional[dict[str, Any]] = None,
+) -> Generator[Any, None, None]:
     """Wrap a streaming response to collect chunks and emit a span on completion."""
-    chunks = []
-    tool_acc: dict[int, dict] = {}
-    st = {"in_tok": 0, "out_tok": 0, "emitted": False}
+    chunks: list[str] = []
+    tool_acc: dict[int, dict[str, Any]] = {}
+    st: dict[str, Any] = {"in_tok": 0, "out_tok": 0, "emitted": False}
     # Capture the active recorder sink NOW (the trace context is alive at stream start). A stream
     # finalized AFTER its trace context exits (GeneratorExit during GC / interpreter atexit) would
     # otherwise resolve the dispatcher ContextVar to None and silently DROP the span. Binding the
     # emit here + registering a trace-end backstop guarantees the span is captured (parity w/ Gemini/TS).
     bound_emit = capture_active_emit() or _on_span
 
-    def finalize(reason):
+    def finalize(reason: str) -> None:
         if st["emitted"]:
             return
         st["emitted"] = True
         unregister_open_span(span_id)
         complete = reason == "complete"
-        output = "".join(chunks)
+        output = "".join(chunks) or openai_output_text({"tool_calls": [
+            {"function": {"name": t["name"], "arguments": t["args"]}} for t in tool_acc.values()
+        ]})
         if bound_emit:
             bound_emit({
                 "id": span_id,
                 "span_type": "llm_call",
                 "name": "openai.chat.completions.create",
                 "model": model,
-                "input": {"messages": [
-                    {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                    for m in messages[:10]
-                ]},
+                "input": recorded_messages(messages),
                 "output": output[:2000],
                 "input_tokens": st["in_tok"],
                 "output_tokens": st["out_tok"],
@@ -105,7 +123,7 @@ def _wrap_stream(stream, span_id, model, messages, start, tool_schemas=None, sam
 
     register_open_span(span_id, finalize)
 
-    def _gen():
+    def _gen() -> Generator[Any, None, None]:
         try:
             for chunk in stream:
                 _ch = chunk.choices[0] if hasattr(chunk, "choices") and chunk.choices else None
@@ -121,7 +139,7 @@ def _wrap_stream(stream, span_id, model, messages, start, tool_schemas=None, sam
                         acc = tool_acc.setdefault(idx, {"id": None, "name": None, "args": ""})
                         if getattr(tc, "id", None):
                             acc["id"] = tc.id
-                        fn = getattr(tc, "function", None)
+                        fn: Any = getattr(tc, "function", None)
                         if getattr(fn, "name", None):
                             acc["name"] = fn.name
                         if getattr(fn, "arguments", None):
@@ -145,32 +163,34 @@ def _wrap_stream(stream, span_id, model, messages, start, tool_schemas=None, sam
     return _gen()
 
 
-def _wrap_async_stream(stream, span_id, model, messages, start, tool_schemas=None, sampling=None):
+def _wrap_async_stream(
+    stream: Any, span_id: str, model: str, messages: Any, start: float,
+    tool_schemas: Optional[dict[str, Any]] = None, sampling: Optional[dict[str, Any]] = None,
+) -> AsyncGenerator[Any, None]:
     """Async counterpart of _wrap_stream — collects chunks from an async stream + emits a span."""
-    chunks = []
-    tool_acc: dict[int, dict] = {}
-    st = {"in_tok": 0, "out_tok": 0, "emitted": False}
+    chunks: list[str] = []
+    tool_acc: dict[int, dict[str, Any]] = {}
+    st: dict[str, Any] = {"in_tok": 0, "out_tok": 0, "emitted": False}
     # Bind the active sink + register a trace-end backstop (see _wrap_stream): an async stream
     # finalized after its trace context exits must still emit, not silently drop the span.
     bound_emit = capture_active_emit() or _on_span
 
-    def finalize(reason):
+    def finalize(reason: str) -> None:
         if st["emitted"]:
             return
         st["emitted"] = True
         unregister_open_span(span_id)
         complete = reason == "complete"
-        output = "".join(chunks)
+        output = "".join(chunks) or openai_output_text({"tool_calls": [
+            {"function": {"name": t["name"], "arguments": t["args"]}} for t in tool_acc.values()
+        ]})
         if bound_emit:
             bound_emit({
                 "id": span_id,
                 "span_type": "llm_call",
                 "name": "openai.chat.completions.create",
                 "model": model,
-                "input": {"messages": [
-                    {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                    for m in messages[:10]
-                ]},
+                "input": recorded_messages(messages),
                 "output": output[:2000],
                 "input_tokens": st["in_tok"],
                 "output_tokens": st["out_tok"],
@@ -195,7 +215,7 @@ def _wrap_async_stream(stream, span_id, model, messages, start, tool_schemas=Non
 
     register_open_span(span_id, finalize)
 
-    async def _agen():
+    async def _agen() -> AsyncGenerator[Any, None]:
         try:
             async for chunk in stream:
                 _ch = chunk.choices[0] if hasattr(chunk, "choices") and chunk.choices else None
@@ -209,7 +229,7 @@ def _wrap_async_stream(stream, span_id, model, messages, start, tool_schemas=Non
                         acc = tool_acc.setdefault(idx, {"id": None, "name": None, "args": ""})
                         if getattr(tc, "id", None):
                             acc["id"] = tc.id
-                        fn = getattr(tc, "function", None)
+                        fn: Any = getattr(tc, "function", None)
                         if getattr(fn, "name", None):
                             acc["name"] = fn.name
                         if getattr(fn, "arguments", None):
@@ -233,12 +253,16 @@ def _wrap_async_stream(stream, span_id, model, messages, start, tool_schemas=Non
     return _agen()
 
 
-def install_openai_interceptor(on_span=None):
+def install_openai_interceptor(on_span: Optional[Callable[[dict[str, Any]], Any]] = None) -> None:
+    with _install_lock:
+        _install_openai_interceptor_locked(on_span)
+
+
+def _install_openai_interceptor_locked(on_span: Optional[Callable[[dict[str, Any]], Any]] = None) -> None:
     global _original_create, _original_async_create, _installed, _on_span
     if _installed:
         if on_span:
             _on_span = on_span
-        reset_tool_result_dedup()
         return
 
     try:
@@ -247,10 +271,13 @@ def install_openai_interceptor(on_span=None):
         return
 
     _on_span = on_span
-    reset_tool_result_dedup()
+    if is_retrace_wrapper(Completions.create):
+        # Already patched (e.g. after a module reload reset our globals): keep the original we have.
+        _installed = True
+        return
     _original_create = Completions.create
 
-    def patched_create(self, *args, **kwargs):
+    def patched_create(self: Any, *args: Any, **kwargs: Any) -> Any:
         from retrace.replay import consume_cassette_entry, is_replaying
 
         model = kwargs.get("model", "unknown")
@@ -266,7 +293,7 @@ def install_openai_interceptor(on_span=None):
             isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
             for m in messages if isinstance(m, dict)
         )
-        span_metadata = {}
+        span_metadata: dict[str, Any] = {}
         if has_vision:
             span_metadata["vision"] = True
         if response_format:
@@ -295,17 +322,20 @@ def install_openai_interceptor(on_span=None):
 
             # Streaming response: wrap the iterator to collect chunks
             if is_streaming and hasattr(result, "__iter__"):
-                return _wrap_stream(result, span_id, model, messages, start, tool_schemas, sampling)
+                return SyncStreamProxy(
+                    result, _wrap_stream(result, span_id, model, messages, start, tool_schemas, sampling)
+                )
 
             duration_ms = int((time.time() - start) * 1000)
-            usage = getattr(result, "usage", None)
+            parsed = parsed_response(result)  # a raw-response wrapper (langchain-openai) → the completion
+            usage = getattr(parsed, "usage", None)
             input_tokens = getattr(usage, "prompt_tokens", 0) or 0
             output_tokens = getattr(usage, "completion_tokens", 0) or 0
             output = ""
             msg = None
-            if hasattr(result, "choices") and result.choices:
-                msg = result.choices[0].message
-                output = getattr(msg, "content", "") or ""
+            if hasattr(parsed, "choices") and parsed.choices:
+                msg = parsed.choices[0].message
+                output = openai_output_text(msg)
 
             if _on_span:
                 _on_span({
@@ -313,10 +343,7 @@ def install_openai_interceptor(on_span=None):
                     "span_type": "llm_call",
                     "name": "openai.chat.completions.create",
                     "model": model,
-                    "input": {"messages": [
-                        {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                        for m in messages[:10]
-                    ]},
+                    "input": recorded_messages(messages),
                     "output": output[:2000],
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -340,25 +367,23 @@ def install_openai_interceptor(on_span=None):
                     "span_type": "llm_call",
                     "name": "openai.chat.completions.create",
                     "model": model,
-                    "input": {"messages": [
-                        {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                        for m in messages[:10]
-                    ]},
+                    "input": recorded_messages(messages),
                     "duration_ms": duration_ms,
                     "error": str(e),
                 })
             raise
 
-    Completions.create = patched_create
+    mark_retrace_wrapper(patched_create)
+    setattr(Completions, "create", patched_create)
 
     # Async client instrumentation (AsyncOpenAI). Without this, async users record nothing
     # while the README promises auto-capture.
     try:
         from openai.resources.chat.completions import AsyncCompletions
-        if _original_async_create is None:
+        if _original_async_create is None and not is_retrace_wrapper(AsyncCompletions.create):
             _original_async_create = AsyncCompletions.create
 
-        async def patched_async_create(self, *args, **kwargs):
+        async def patched_async_create(self: Any, *args: Any, **kwargs: Any) -> Any:
             from retrace.replay import consume_cassette_entry, is_replaying
 
             model = kwargs.get("model", "unknown")
@@ -382,28 +407,31 @@ def install_openai_interceptor(on_span=None):
 
             start = time.time()
             try:
-                result = await _original_async_create(self, *args, **kwargs)
+                original = _original_async_create
+                if original is None:  # installed only after the original was captured
+                    raise RuntimeError("retrace: async interceptor has no original method")
+                result = await original(self, *args, **kwargs)
                 if is_streaming and hasattr(result, "__aiter__"):
-                    return _wrap_async_stream(result, span_id, model, messages, start, tool_schemas, sampling)
+                    return AsyncStreamProxy(
+                        result, _wrap_async_stream(result, span_id, model, messages, start, tool_schemas, sampling)
+                    )
                 duration_ms = int((time.time() - start) * 1000)
-                usage = getattr(result, "usage", None)
+                parsed = parsed_response(result)
+                usage = getattr(parsed, "usage", None)
                 input_tokens = getattr(usage, "prompt_tokens", 0) or 0
                 output_tokens = getattr(usage, "completion_tokens", 0) or 0
                 output = ""
                 msg = None
-                if hasattr(result, "choices") and result.choices:
-                    msg = result.choices[0].message
-                    output = getattr(msg, "content", "") or ""
+                if hasattr(parsed, "choices") and parsed.choices:
+                    msg = parsed.choices[0].message
+                    output = openai_output_text(msg)
                 if _on_span:
                     _on_span({
                         "id": span_id,
                         "span_type": "llm_call",
                         "name": "openai.chat.completions.create",
                         "model": model,
-                        "input": {"messages": [
-                            {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                            for m in messages[:10]
-                        ]},
+                        "input": recorded_messages(messages),
                         "output": output[:2000],
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
@@ -426,35 +454,40 @@ def install_openai_interceptor(on_span=None):
                         "span_type": "llm_call",
                         "name": "openai.chat.completions.create",
                         "model": model,
-                        "input": {"messages": [
-                            {"role": m.get("role", ""), "content": str(m.get("content", ""))[:1000]}
-                            for m in messages[:10]
-                        ]},
+                        "input": recorded_messages(messages),
                         "duration_ms": duration_ms,
                         "error": str(e),
                     })
                 raise
 
-        AsyncCompletions.create = patched_async_create
+        # Already ours (the module globals were reset by a reload): leave the existing patch.
+        if not is_retrace_wrapper(AsyncCompletions.create):
+            mark_retrace_wrapper(patched_async_create)
+            setattr(AsyncCompletions, "create", patched_async_create)
     except ImportError:
         pass
 
     _installed = True
 
 
-def uninstall_openai_interceptor():
+def uninstall_openai_interceptor() -> None:
+    with _install_lock:
+        _uninstall_openai_interceptor_locked()
+
+
+def _uninstall_openai_interceptor_locked() -> None:
     global _installed, _on_span, _original_create
     if not _installed or not _original_create:
         return
     try:
         from openai.resources.chat.completions import Completions
-        Completions.create = _original_create
+        setattr(Completions, "create", _original_create)
     except ImportError:
         pass
     try:
         if _original_async_create is not None:
             from openai.resources.chat.completions import AsyncCompletions
-            AsyncCompletions.create = _original_async_create
+            setattr(AsyncCompletions, "create", _original_async_create)
     except ImportError:
         pass
     _installed = False

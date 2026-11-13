@@ -12,7 +12,7 @@ from retrace import SpanType, TraceRecorder
 def test_span_ended_omits_null_error(mt):
     m = MagicMock()
     mt.return_value = m
-    cfg.configure(api_key="rt_live_t", base_url="http://x:1", enabled=True)
+    cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1", enabled=True)
 
     rec = TraceRecorder(name="payload-test")
     rec.start_trace()
@@ -32,7 +32,7 @@ def test_span_ended_omits_null_error(mt):
 def test_span_ended_keeps_real_error(mt):
     m = MagicMock()
     mt.return_value = m
-    cfg.configure(api_key="rt_live_t", base_url="http://x:1", enabled=True)
+    cfg.configure(api_key="rt_t", base_url="http://127.0.0.1:1", enabled=True)
 
     rec = TraceRecorder(name="payload-test-err")
     rec.start_trace()

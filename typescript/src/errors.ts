@@ -7,7 +7,7 @@ export class RetraceAuthError extends RetraceError {
 }
 
 export class RetraceCreditsExhaustedError extends RetraceError {
-  constructor(message = "Monthly trace limit reached. Upgrade at retrace.yashbogam.me/pricing") { super(message); this.name = "RetraceCreditsExhaustedError"; }
+  constructor(message = "Monthly trace limit reached. Upgrade at retraceai.tech/pricing") { super(message); this.name = "RetraceCreditsExhaustedError"; }
 }
 
 export class RetraceConnectionError extends RetraceError {
@@ -17,6 +17,28 @@ export class RetraceConnectionError extends RetraceError {
 export class RetraceRateLimitError extends RetraceError {
   retryAfter: number;
   constructor(retryAfter: number) { super(`Rate limited. Retry after ${retryAfter}s`); this.name = "RetraceRateLimitError"; this.retryAfter = retryAfter; }
+}
+
+/**
+ * An enforcement circuit breaker blocked (or held) the action. Thrown by the pre-call gate when a
+ * LOCAL limit (max steps / tokens / USD per run) is exceeded, or when an opt-in server-side policy
+ * returns a block/hold verdict. NEVER thrown silently — the agent loop stops here rather than
+ * continuing past a runaway condition. Mirrors the Python `RetraceEnforcementError`.
+ */
+export class RetraceEnforcementError extends RetraceError {
+  /** "block" or "hold". */
+  verdict: string;
+  /** The ceiling that tripped, or the server reason. */
+  reason: string;
+  /** The server policy that tripped, when the verdict came from the server (else undefined). */
+  policyId?: string;
+  constructor(reason: string, verdict = "block", policyId?: string) {
+    super(`Enforcement ${verdict}: ${reason}`);
+    this.name = "RetraceEnforcementError";
+    this.verdict = verdict;
+    this.reason = reason;
+    this.policyId = policyId;
+  }
 }
 
 /**

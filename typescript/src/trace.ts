@@ -1,4 +1,5 @@
 import { genId, nowIso, utcNow } from "./utils.js";
+import { getConfig } from "./config.js";
 
 export enum SpanType {
   LLM_CALL = "llm_call",
@@ -30,7 +31,11 @@ export interface SpanData {
   cost?: number;
   duration_ms?: number;
   metadata?: Record<string, unknown>;
+  // Multi-agent attribution. CANONICAL contract: @retrace/shared `AgentSpanFieldsSchema`
+  // (packages/shared/src/agents.ts) — keep these field names in sync (MA-SDK-001).
   agent_id?: string;
+  parent_agent_id?: string;
+  agent_role?: string;
   started_at: string;
   ended_at?: string;
   error?: string;
@@ -68,8 +73,23 @@ export class SpanBuilder {
   setOutput(output: unknown) { this.data.output = output; return this; }
   setParentId(id: string) { this.data.parent_id = id; return this; }
   setTraceId(id: string) { this.data.trace_id = id; return this; }
+  /** Continue a span that was already sent (a tool call the model requested, filled in by the app). */
+  adopt(existing: SpanData) {
+    this.data.id = existing.id;
+    if (existing.parent_id) this.data.parent_id = existing.parent_id;
+    if (existing.metadata) this.data.metadata = { ...existing.metadata };
+    if (existing.model) this.data.model = existing.model;
+    return this;
+  }
   setMetadata(m: Record<string, unknown>) { this.data.metadata = m; return this; }
   setAgentId(id: string) { this.data.agent_id = id; return this; }
+  /** Multi-agent topology: who delegated to this agent + this agent's role/persona. */
+  setAgent(opts: { id?: string; parentId?: string; role?: string }) {
+    if (opts.id !== undefined) this.data.agent_id = opts.id;
+    if (opts.parentId !== undefined) this.data.parent_agent_id = opts.parentId;
+    if (opts.role !== undefined) this.data.agent_role = opts.role;
+    return this;
+  }
 
   start(): this {
     this._startTime = utcNow();
@@ -128,6 +148,9 @@ export class TraceBuilder {
   }
 
   addSpan(span: SpanData) {
+    // A span continued later (a requested tool call the app filled in) replaces its first record.
+    const at = this.data.spans!.findIndex((s) => s.id === span.id);
+    if (at >= 0) { this.data.spans![at] = span; return; }
     // Spans are streamed individually through the transport (and HTTPTransport keeps its own
     // per-trace buffer for the batched POST), so this retained array is only an in-memory
     // convenience and is never itself transmitted. Cap it so init()'s long-lived ambient
@@ -141,5 +164,13 @@ export class TraceBuilder {
   setProjectId(id: string) { this.data.project_id = id; }
   setSessionId(id: string) { this.data.session_id = id; }
   setMetadata(m: Record<string, unknown>) { this.data.metadata = m; }
-  toDict(): TraceData { return this.data; }
+  toDict(): TraceData {
+    // Tag the run's environment (e.g. "sandbox") from config as metadata.environment so the server
+    // routes it to the matching data-namespace. Explicit per-trace metadata.environment always wins.
+    const env = getConfig().environment;
+    if (env && !(this.data.metadata && "environment" in this.data.metadata)) {
+      this.data.metadata = { ...(this.data.metadata || {}), environment: env };
+    }
+    return this.data;
+  }
 }

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/yash1511-bogam/retrace-sdk/main/assets/banner.gif" alt="Retrace" width="480" />
+<img src="https://raw.githubusercontent.com/Retraceai-tech/retrace-sdk/main/assets/banner.gif" alt="Retrace" width="480" />
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)
 
@@ -207,7 +207,7 @@ Typed errors for auth failures, credit exhaustion, rate limiting, and enforcemen
 ## Links
 
 - [Documentation](https://docs.retraceai.tech)
-- [GitHub](https://github.com/yash1511-bogam/retrace-sdk)
+- [GitHub](https://github.com/Retraceai-tech/retrace-sdk)
 - [npm](https://www.npmjs.com/package/retrace-sdk)
 
 ## License

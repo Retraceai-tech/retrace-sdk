@@ -2,8 +2,8 @@
 
 These use a fake recorder so they run without langchain/crewai installed and without a network.
 """
-from retrace.adapters.langchain import RetraceCallbackHandler
 from retrace.adapters.crewai import retrace_step_callback, retrace_task_callback
+from retrace.adapters.langchain import RetraceCallbackHandler
 from retrace.trace import SpanType
 
 

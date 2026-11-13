@@ -1,8 +1,10 @@
 import { SpanData, SpanType } from "../trace.js";
+import { recordedContents } from "./messages.js";
 import { genId, nowIso, truncateJson } from "../utils.js";
 import { dispatchRegisterOpenSpan, dispatchUnregisterOpenSpan, captureActiveSpanEmit } from "./_dispatch.js";
-import { emitGeminiToolCalls, emitGeminiToolResults, resetToolResultDedup, extractToolSchemas, extractSamplingParams } from "./tool-spans.js";
+import { emitGeminiToolCalls, emitGeminiToolResults, extractToolSchemas, extractSamplingParams } from "./tool-spans.js";
 import { UNKNOWN_MODEL_PRICING, costFromRate } from "../pricing.js";
+import { createProviderPatcher, pathOf, type PatchablePrototype } from "./provider-modules.js";
 
 const PRICING: Record<string, [number, number]> = {
   "gemini-3.1-flash-lite": [0.10, 0.40],
@@ -25,13 +27,6 @@ function calcCost(model: string, inputTokens: number, outputTokens: number): num
 }
 
 let onSpanCallback: ((span: SpanData) => void) | null = null;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let patchedProto: any = null;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let origGenerate: any = null;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let origStream: any = null;
-let installPromise: Promise<void> | null = null;
 
 // Wrap a single `generateContent` implementation (the per-instance bound method). Returns a
 // function with identical signature that records a span around the original call.
@@ -70,7 +65,7 @@ function wrapGenerate(original: (...a: unknown[]) => unknown): (...a: unknown[])
       const span: SpanData = {
         id: spanId, trace_id: "", parent_id: null,
         span_type: SpanType.LLM_CALL, name: "retrace.ai.generate", model,
-        input: truncateJson(contents), output: truncateJson(outputText),
+        input: recordedContents(contents), output: truncateJson(outputText),
         input_tokens: inputTokens, output_tokens: outputTokens,
         cost: calcCost(model, inputTokens, outputTokens),
         duration_ms: durationMs, started_at: startedAt, ended_at: nowIso(),
@@ -86,7 +81,7 @@ function wrapGenerate(original: (...a: unknown[]) => unknown): (...a: unknown[])
       onSpanCallback?.({
         id: spanId, trace_id: "", parent_id: null,
         span_type: SpanType.LLM_CALL, name: "retrace.ai.generate", model,
-        input: truncateJson(contents), started_at: startedAt, ended_at: nowIso(),
+        input: recordedContents(contents), started_at: startedAt, ended_at: nowIso(),
         duration_ms: Date.now() - startMs,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -128,7 +123,7 @@ function wrapStream(original: (...a: unknown[]) => unknown): (...a: unknown[]) =
       onSpanCallback?.({
         id: spanId, trace_id: "", parent_id: null,
         span_type: SpanType.LLM_CALL, name: "retrace.ai.generate", model,
-        input: truncateJson(contents), started_at: startedAt, ended_at: nowIso(),
+        input: recordedContents(contents), started_at: startedAt, ended_at: nowIso(),
         duration_ms: Date.now() - startMs,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -170,7 +165,7 @@ function wrapStream(original: (...a: unknown[]) => unknown): (...a: unknown[]) =
       const span: SpanData = {
         id: spanId, trace_id: "", parent_id: null,
         span_type: SpanType.LLM_CALL, name: "retrace.ai.generate", model,
-        input: truncateJson(contents), output: truncateJson(outputText),
+        input: recordedContents(contents), output: truncateJson(outputText),
         input_tokens: inputTokens, output_tokens: outputTokens,
         cost: calcCost(model, inputTokens, outputTokens),
         duration_ms: Date.now() - startMs, started_at: startedAt, ended_at: nowIso(),
@@ -221,37 +216,27 @@ function wrapStream(original: (...a: unknown[]) => unknown): (...a: unknown[]) =
 // properties (not on the prototype), so patching the prototype's public method is a no-op. However,
 // the public methods delegate to `generateContentInternal` / `generateContentStreamInternal`, which
 // ARE regular methods on `Models.prototype`. Patching those is RETROACTIVE to every instance
-// regardless of construction order (mirroring the Python SDK's class-method patch) — so no
-// install-before-construction requirement, no race, and no `ready()` escape hatch is needed.
+// regardless of construction order (mirroring the Python SDK's class-method patch).
 export function installGeminiInterceptor(onSpan: (span: SpanData) => void): Promise<void> {
   onSpanCallback = onSpan;
-  resetToolResultDedup();
-  if (installPromise) return installPromise; // synchronous dedupe — prevents the double-wrap race
-  installPromise = import("@google/genai").then((genaiMod) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mod = genaiMod as Record<string, any>;
-    const Models = mod?.Models || mod?.default?.Models;
-    const proto = Models?.prototype;
-    if (!proto || typeof proto.generateContentInternal !== "function") return;
-    patchedProto = proto;
-    origGenerate = proto.generateContentInternal;
-    proto.generateContentInternal = wrapGenerate(origGenerate);
-    if (typeof proto.generateContentStreamInternal === "function") {
-      origStream = proto.generateContentStreamInternal;
-      proto.generateContentStreamInternal = wrapStream(origStream);
-    }
-  }).catch(() => { /* @google/genai not installed — skip */ });
-  return installPromise;
+  return patcher.install();
 }
 
+/** Models.prototype in one loaded copy (ES or CommonJS build) of @google/genai. */
+function modelsPrototype(mod: unknown): PatchablePrototype | null {
+  const proto = pathOf(mod, "Models", "prototype") ?? pathOf(mod, "default", "Models", "prototype");
+  return typeof pathOf(proto, "generateContentInternal") === "function" ? (proto as PatchablePrototype) : null;
+}
+
+const patcher = createProviderPatcher({
+  specifier: "@google/genai",
+  load: () => import("@google/genai"),
+  find: modelsPrototype,
+  methods: ["generateContentInternal", "generateContentStreamInternal"],
+  wrap: (method, original) => (method === "generateContentInternal" ? wrapGenerate(original) : wrapStream(original)),
+});
+
 export function uninstallGeminiInterceptor() {
-  if (patchedProto) {
-    if (origGenerate) patchedProto.generateContentInternal = origGenerate;
-    if (origStream) patchedProto.generateContentStreamInternal = origStream;
-  }
-  installPromise = null;
+  patcher.uninstall();
   onSpanCallback = null;
-  patchedProto = null;
-  origGenerate = null;
-  origStream = null;
 }

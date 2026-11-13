@@ -3,9 +3,11 @@ import { genId, nowIso, truncateJson, wasTruncated } from "../utils.js";
 import { isReplaying, consumeCassetteEntry } from "../replay.js";
 import { getConfig } from "../config.js";
 import { RetraceRateLimitError, RetraceAuthError, RetraceConnectionError } from "../errors.js";
-import { emitOpenAIToolCalls, emitOpenAIToolResults, parseToolArgs, resetToolResultDedup, extractToolSchemas, extractSamplingParams } from "./tool-spans.js";
+import { recordedMessages } from "./messages.js";
+import { emitOpenAIToolCalls, emitOpenAIToolResults, parseToolArgs, extractToolSchemas, extractSamplingParams, openAIOutputText } from "./tool-spans.js";
 import { dispatchRegisterOpenSpan, dispatchUnregisterOpenSpan } from "./_dispatch.js";
 import { UNKNOWN_MODEL_PRICING, costFromRate } from "../pricing.js";
+import { createProviderPatcher, pathOf, type PatchablePrototype } from "./provider-modules.js";
 
 /** Hardcoded fallback pricing ($/1M tokens: [input, output]). Updated periodically. */
 const FALLBACK_PRICING: Record<string, [number, number]> = {
@@ -64,46 +66,38 @@ function calcCost(model: string, inputTokens: number, outputTokens: number): num
   return costFromRate(UNKNOWN_MODEL_PRICING, inputTokens, outputTokens);
 }
 
-let originalCreate: ((...args: unknown[]) => unknown) | null = null;
-let installed = false;
-// Set SYNCHRONOUSLY before the async import() so a second concurrent install can't double-wrap the
-// prototype. (`installed` is set inside the .then() and is therefore too late to guard the race.)
-let installStarted = false;
 let onSpanCallback: ((span: SpanData) => void) | null = null;
 
-export function installOpenAIInterceptor(onSpan: (span: SpanData) => void) {
-  // Always refresh the active callback; the prototype PATCH must happen at most once. The guard is
-  // a synchronous flag set before import() so two concurrent installs (e.g. two recorders starting
-  // before "openai" resolves) can't both patch and double-wrap create() → doubled spans/billing.
-  onSpanCallback = onSpan;
-  resetToolResultDedup();
-  if (installStarted) return;
-  installStarted = true;
-
-  import("openai").then((openaiMod) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mod = openaiMod as any;
-    const proto = mod?.OpenAI?.Chat?.Completions?.prototype || mod?.default?.Chat?.Completions?.prototype;
-    if (!proto?.create) {
-      // Try accessing prototype chain without instantiation
-      const OpenAI = mod?.OpenAI || mod?.default;
-      if (OpenAI?.prototype?.chat) {
-        const chatProto = Object.getPrototypeOf(Object.getPrototypeOf(OpenAI.prototype.chat)?.completions || {});
-        if (chatProto?.create) {
-          originalCreate = chatProto.create;
-          chatProto.create = createPatchedCreate();
-          installed = true;
-        }
-      }
-      return;
-    }
-    originalCreate = proto.create;
-    proto.create = createPatchedCreate();
-    installed = true;
-  }).catch(() => { installStarted = false; });
+/** Chat.Completions.prototype in one loaded copy (ES or CommonJS build) of the openai package. */
+function completionsPrototype(mod: unknown): PatchablePrototype | null {
+  const direct = pathOf(mod, "OpenAI", "Chat", "Completions", "prototype") ?? pathOf(mod, "default", "Chat", "Completions", "prototype");
+  if (typeof pathOf(direct, "create") === "function") return direct as PatchablePrototype;
+  // Older layouts: reach the prototype through OpenAI.prototype.chat without instantiating a client.
+  const OpenAI = pathOf(mod, "OpenAI") ?? pathOf(mod, "default");
+  const completions = pathOf(OpenAI, "prototype", "chat", "completions");
+  const chatProto = completions ? Object.getPrototypeOf(Object.getPrototypeOf(completions)) : null;
+  return typeof pathOf(chatProto, "create") === "function" ? (chatProto as PatchablePrototype) : null;
 }
 
-function createPatchedCreate() {
+const patcher = createProviderPatcher({
+  specifier: "openai",
+  load: () => import("openai"),
+  find: completionsPrototype,
+  methods: ["create"],
+  wrap: (_method, original) => createPatchedCreate(original),
+});
+
+/**
+ * Patches `chat.completions.create` in every loaded copy of openai. Always refreshes the active
+ * callback; each prototype is patched at most once, so concurrent or repeated installs never
+ * double-wrap create() (which would double spans and billing).
+ */
+export function installOpenAIInterceptor(onSpan: (span: SpanData) => void): Promise<void> {
+  onSpanCallback = onSpan;
+  return patcher.install();
+}
+
+function createPatchedCreate(originalCreate: (...args: unknown[]) => unknown) {
   return async function (this: unknown, ...args: unknown[]) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const opts = (args[0] as Record<string, any>) || {};
@@ -136,7 +130,7 @@ function createPatchedCreate() {
         const span: SpanData = {
           id: spanId, trace_id: "", parent_id: null,
           span_type: SpanType.LLM_CALL, name: "openai.chat.completions.create", model,
-          input: truncateJson({ messages: messages.slice(0, 10) }),
+          input: recordedMessages(messages),
           output: truncateJson(output),
           duration_ms: 0, started_at: startedAt, ended_at: nowIso(),
           metadata: { replayed: true },
@@ -153,7 +147,7 @@ function createPatchedCreate() {
     }
 
     try {
-      const result = await originalCreate!.apply(this, args);
+      const result = await originalCreate.apply(this, args);
 
       // Streaming response: wrap the async iterator to collect chunks
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -180,7 +174,7 @@ function createPatchedCreate() {
           const span: SpanData = {
             id: spanId, trace_id: "", parent_id: null,
             span_type: SpanType.LLM_CALL, name: "openai.chat.completions.create", model,
-            input: truncateJson({ messages: messages.slice(0, 10) }),
+            input: recordedMessages(messages),
             output: truncateJson(output),
             input_tokens: inputTokens, output_tokens: outputTokens,
             cost: calcCost(model, inputTokens, outputTokens),
@@ -244,7 +238,7 @@ function createPatchedCreate() {
       const res = result as any;
       const inputTokens = res?.usage?.prompt_tokens || 0;
       const outputTokens = res?.usage?.completion_tokens || 0;
-      const output = res?.choices?.[0]?.message?.content || "";
+      const output = openAIOutputText(res?.choices?.[0]?.message);
 
       // Extract token IDs and logprobs if available (requires logprobs: true in request)
       const choiceLogprobs = res?.choices?.[0]?.logprobs?.content;
@@ -256,7 +250,7 @@ function createPatchedCreate() {
       const span: SpanData = {
         id: spanId, trace_id: "", parent_id: null,
         span_type: SpanType.LLM_CALL, name: "openai.chat.completions.create", model,
-        input: truncateJson({ messages: messages.slice(0, 10), ...(responseFormat ? { response_format: responseFormat } : {}) }),
+        input: recordedMessages(messages, responseFormat ? { response_format: responseFormat } : {}),
         output: truncateJson(output),
         input_tokens: inputTokens, output_tokens: outputTokens,
         cost: calcCost(model, inputTokens, outputTokens),
@@ -277,7 +271,7 @@ function createPatchedCreate() {
       const span: SpanData = {
         id: spanId, trace_id: "", parent_id: null,
         span_type: SpanType.LLM_CALL, name: "openai.chat.completions.create", model,
-        input: truncateJson({ messages: messages.slice(0, 10) }),
+        input: recordedMessages(messages),
         started_at: startedAt, ended_at: nowIso(),
         duration_ms: Date.now() - startMs,
         error: err instanceof Error ? err.message : String(err),
@@ -286,7 +280,12 @@ function createPatchedCreate() {
       // Wrap provider errors in typed Retrace exceptions for user-facing clarity
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const status = (err as any)?.status || (err as any)?.response?.status;
-      if (status === 429) throw new RetraceRateLimitError(parseInt((err as Record<string, Record<string, string>>)?.headers?.["retry-after"] || "60", 10));
+      // openai v5+ makes APIError.headers a Web `Headers` instance (use .get()); pre-v5 it was a
+      // plain record (bracket access). Support both so retry-after is honored across the peer range.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const eh = (err as any)?.headers;
+      const retryAfter = (eh && typeof eh.get === "function" ? eh.get("retry-after") : eh?.["retry-after"]) || "60";
+      if (status === 429) throw new RetraceRateLimitError(parseInt(retryAfter, 10));
       if (status === 401 || status === 403) throw new RetraceAuthError(`OpenAI auth failed: ${(err as Error).message}`);
       if ((err as Error)?.message?.includes("ECONNREFUSED") || (err as Error)?.message?.includes("fetch failed")) {
         throw new RetraceConnectionError(`OpenAI connection failed: ${(err as Error).message}`);
@@ -297,13 +296,6 @@ function createPatchedCreate() {
 }
 
 export function uninstallOpenAIInterceptor() {
-  if (!installed || !originalCreate) return;
-  import("openai").then((openaiMod) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mod = openaiMod as any;
-    const proto = mod?.OpenAI?.Chat?.Completions?.prototype || mod?.default?.Chat?.Completions?.prototype;
-    if (proto) proto.create = originalCreate;
-  }).catch(() => {});
-  installed = false;
+  patcher.uninstall();
   onSpanCallback = null;
 }

@@ -19,7 +19,7 @@ def test_classify_structured():
 def test_fp6_error_frame_surfaces_to_on_error():
     """F-P6: a server `error` frame (previously SWALLOWED) must surface as a structured signal."""
     got = []
-    retrace.configure(api_key="rt_live_x", on_error=lambda s: got.append(s))
+    retrace.configure(api_key="rt_x", on_error=lambda s: got.append(s))
     t = WSTransport()
     t._dispatch({"type": "error", "error": "Rate limit exceeded"})
     assert len(got) == 1
@@ -29,7 +29,7 @@ def test_fp6_error_frame_surfaces_to_on_error():
 def test_throwing_callback_does_not_kill_listener():
     def boom(_):
         raise RuntimeError("user callback bug")
-    retrace.configure(api_key="rt_live_x", on_error=boom)
+    retrace.configure(api_key="rt_x", on_error=boom)
     t = WSTransport()
     # Must NOT raise — a buggy user callback can't take down the WS listener thread.
     t._dispatch({"type": "error", "error": "boom"})
@@ -37,7 +37,7 @@ def test_throwing_callback_does_not_kill_listener():
 
 def test_unknown_type_warns_and_is_throttled(caplog):
     """F-P6 durable fix: unknown/unhandled message types throttled-warn, never silently swallowed."""
-    retrace.configure(api_key="rt_live_x", on_error=None)
+    retrace.configure(api_key="rt_x", on_error=None)
     t = WSTransport()
     with caplog.at_level(logging.WARNING, logger="retrace"):
         t._dispatch({"type": "zzz_future_type"})
@@ -47,10 +47,21 @@ def test_unknown_type_warns_and_is_throttled(caplog):
 
 
 def test_default_warn_throttled_no_callback(caplog):
-    retrace.configure(api_key="rt_live_x", on_error=None)
+    retrace.configure(api_key="rt_x", on_error=None)
     t = WSTransport()
     with caplog.at_level(logging.WARNING, logger="retrace"):
         t._dispatch({"type": "error", "error": "Rate limit exceeded"})
         t._dispatch({"type": "error", "error": "Rate limit exceeded"})  # throttled
     warns = [r for r in caplog.records if "rate_limited" in r.getMessage()]
     assert len(warns) == 1
+
+
+def test_acks_and_live_feed_frames_are_not_reported_as_unknown(caplog):
+    """Servers send per-frame `ack`s (and, before API 1.28.22, the account's live feed) to SDK sockets.
+    They are known frames with no use in the SDK, so they must not log "unknown server message type"."""
+    retrace.configure(api_key="rt_x", on_error=None)
+    t = WSTransport()
+    with caplog.at_level(logging.WARNING, logger="retrace"):
+        for mtype in ("ack", "trace_started", "span_started", "span_ended", "trace_ended"):
+            t._dispatch({"type": mtype, "id": "x", "data": {"trace_id": "t"}})
+    assert [r.getMessage() for r in caplog.records] == []

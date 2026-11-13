@@ -14,9 +14,9 @@ describe("Config", () => {
   });
 
   it("configures custom values", () => {
-    configure({ apiKey: "rt_live_test", baseUrl: "https://api.example.com" });
+    configure({ apiKey: "rt_test", baseUrl: "https://api.example.com" });
     const c = getConfig();
-    expect(c.apiKey).toBe("rt_live_test");
+    expect(c.apiKey).toBe("rt_test");
     expect(c.baseUrl).toBe("https://api.example.com");
     expect(c.wsUrl).toBe("wss://api.example.com");
   });
@@ -29,12 +29,12 @@ describe("Config", () => {
   });
 
   it("throws on invalid API key prefix", () => {
-    expect(() => configure({ apiKey: "invalid_key" })).toThrow("rt_live_");
+    expect(() => configure({ apiKey: "invalid_key" })).toThrow("rt_");
   });
 
   it("does not warn on valid API key", () => {
     const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    configure({ apiKey: "rt_live_valid123" });
+    configure({ apiKey: "rt_valid123" });
     expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
   });
@@ -78,14 +78,14 @@ describe("Trace model", () => {
 
 describe("Recorder", () => {
   it("trace() wraps sync function", async () => {
-    configure({ apiKey: "rt_live_t", baseUrl: "http://x:1", enabled: true });
+    configure({ apiKey: "rt_t", baseUrl: "http://127.0.0.1:1", enabled: true });
     const { trace } = await import("./recorder.js");
     const fn = trace((x: unknown) => `result:${x}`, { name: "sync-fn" });
     expect(fn("hi")).toBe("result:hi");
   });
 
   it("trace() wraps async function", async () => {
-    configure({ apiKey: "rt_live_t", baseUrl: "http://x:1", enabled: true });
+    configure({ apiKey: "rt_t", baseUrl: "http://127.0.0.1:1", enabled: true });
     const { trace } = await import("./recorder.js");
     const fn = trace(async (x: unknown) => `async:${x}`, { name: "async-fn" });
     const result = await fn("hi");
@@ -93,14 +93,14 @@ describe("Recorder", () => {
   });
 
   it("trace() propagates exceptions", async () => {
-    configure({ apiKey: "rt_live_t", baseUrl: "http://x:1", enabled: true });
+    configure({ apiKey: "rt_t", baseUrl: "http://127.0.0.1:1", enabled: true });
     const { trace } = await import("./recorder.js");
     const fn = trace(() => { throw new Error("boom"); }, { name: "err-fn" });
     expect(() => fn()).toThrow("boom");
   });
 
   it("disabled SDK is no-op", async () => {
-    configure({ apiKey: "rt_live_t", enabled: false });
+    configure({ apiKey: "rt_t", enabled: false });
     const { trace } = await import("./recorder.js");
     const fn = trace((x: unknown) => `r:${x}`, { name: "off" });
     expect(fn("hi")).toBe("r:hi");
@@ -109,7 +109,7 @@ describe("Recorder", () => {
 
 describe("Transport", () => {
   it("HTTPTransport accumulates and flushes", async () => {
-    configure({ apiKey: "rt_live_t", baseUrl: "http://x:1" });
+    configure({ apiKey: "rt_t", baseUrl: "http://127.0.0.1:1" });
     const { HTTPTransport } = await import("./transport.js");
     const http = new HTTPTransport();
 
@@ -138,7 +138,7 @@ describe("Transport", () => {
 
 describe("README examples", () => {
   it("TypeScript README example works", async () => {
-    configure({ apiKey: "rt_live_test", enabled: false });
+    configure({ apiKey: "rt_test", enabled: false });
     const { trace } = await import("./recorder.js");
     const runAgent = trace(async (prompt: unknown) => {
       return `Response to: ${prompt}`;

@@ -6,12 +6,13 @@ import { getConfig, requireApiKey } from "./config.js";
  * divergence in later runs as a regression.
  */
 export async function markGolden(traceId: string, golden = true): Promise<void> {
-  requireApiKey();
+  const apiKey = requireApiKey(); // also refuses a cleartext base / WebSocket URL
   const cfg = getConfig();
-  const res = await fetch(`${cfg.baseUrl}/api/v1/traces/${traceId}/golden`, {
+  const res = await fetch(`${cfg.baseUrl}/api/v1/traces/${encodeURIComponent(traceId)}/golden`, {
     method: "POST",
-    headers: { "x-retrace-key": cfg.apiKey, "Content-Type": "application/json" },
+    headers: { "x-retrace-key": apiKey, "Content-Type": "application/json" },
     body: JSON.stringify({ golden }),
+    redirect: "error",
   });
   if (!res.ok) throw new Error(`markGolden failed: HTTP ${res.status}`);
 }

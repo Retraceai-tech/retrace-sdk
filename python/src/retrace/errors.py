@@ -1,20 +1,23 @@
+from dataclasses import dataclass
+
+
 class RetraceError(Exception):
     """Base error for Retrace SDK."""
     pass
 
 class RetraceAuthError(RetraceError):
     """Invalid or missing API key."""
-    def __init__(self, message="Invalid or missing API key"):
+    def __init__(self, message: str = "Invalid or missing API key") -> None:
         super().__init__(message)
 
 class RetraceCreditsExhaustedError(RetraceError):
     """Monthly trace/AI request limit reached."""
-    def __init__(self, message="Monthly limit reached. Upgrade at retrace.yashbogam.me/pricing"):
+    def __init__(self, message: str = "Monthly limit reached. Upgrade at retraceai.tech/pricing") -> None:
         super().__init__(message)
 
 class RetraceConnectionError(RetraceError):
     """Failed to connect to Retrace API."""
-    def __init__(self, message="Failed to connect to Retrace API"):
+    def __init__(self, message: str = "Failed to connect to Retrace API") -> None:
         super().__init__(message)
 
 class RetraceRateLimitError(RetraceError):
@@ -24,7 +27,22 @@ class RetraceRateLimitError(RetraceError):
         super().__init__(f"Rate limited. Retry after {retry_after}s")
 
 
-from dataclasses import dataclass
+class RetraceEnforcementError(RetraceError):
+    """An enforcement circuit breaker blocked (or held) the action.
+
+    Raised by the pre-call gate when a LOCAL limit (max steps / tokens / USD per run) is exceeded, or
+    when an opt-in server-side policy returns a block/hold verdict. NEVER raised silently — the agent
+    loop stops here rather than continuing past a runaway condition.
+
+    verdict:   "block" or "hold".
+    reason:    human-readable explanation (the ceiling that tripped, or the server reason).
+    policy_id: the server policy that tripped, when the verdict came from the server (else None).
+    """
+    def __init__(self, reason: str, verdict: str = "block", policy_id: str | None = None):
+        self.verdict = verdict
+        self.reason = reason
+        self.policy_id = policy_id
+        super().__init__(f"Enforcement {verdict}: {reason}")
 
 
 @dataclass

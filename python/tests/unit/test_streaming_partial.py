@@ -58,7 +58,9 @@ def test_span_survives_trace_context_exit(monkeypatch):
     # finalize time would yield None and drop the span if the backstop weren't wired.
     monkeypatch.setattr(a, "_on_span", None)
     token = _dispatch.set_active_recorder(lambda s: captured.append(s), FakeSink())
-    gen = a._wrap_anthropic_stream(iter([_delta("hi")]), "sp9", "claude", [{"role": "user", "content": "x"}], time.time())
+    gen = a._wrap_anthropic_stream(
+        iter([_delta("hi")]), "sp9", "claude", [{"role": "user", "content": "x"}], time.time()
+    )
     assert "sp9" in stored                 # registered with the trace-end sink
     _dispatch.reset_active_recorder(token)  # trace context exits -> ContextVar now None
     del gen                                 # generator never drained
